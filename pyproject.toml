@@ -2,7 +2,7 @@
 name = "large_scene_trainer"
 version = "0.1.0"
 description = "Block-partitioned large-scene training orchestration for LichtFeld Studio"
-authors = [{ name = "TODO: your name", email = "TODO@example.com" }]
+authors = [{ name = "oakley thomas", email = "oakley.j.thomas@gmail.com" }]
 license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.10"
 dependencies = [
