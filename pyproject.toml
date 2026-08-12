@@ -1,0 +1,32 @@
+[project]
+name = "large_scene_trainer"
+version = "0.1.0"
+description = "Block-partitioned large-scene training orchestration for LichtFeld Studio"
+authors = [{ name = "TODO: your name", email = "TODO@example.com" }]
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/TODO/large_scene_trainer"
+
+[tool.lichtfeld]
+hot_reload = true
+entry_point = "__init__"
+plugin_api = ">=1,<2"
+lichtfeld_version = ">=0.5.3"
+required_features = []
+
+# ---------------------------------------------------------------------------
+# Dev-only tooling. The host reads [project] and [tool.lichtfeld]; everything
+# below is for pytest/ruff running against core/ outside the application.
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

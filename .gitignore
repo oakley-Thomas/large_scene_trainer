@@ -1,0 +1,19 @@
+# Scaffolded by `LichtFeld-Studio plugin create` — machine-local, never committed
+.venv/
+.vscode/
+pyrightconfig.json
+
+# Run bundles: block datasets, jobs.json, trained PLYs. Large and reproducible.
+out/
+runs/
+
+# Datasets and symlinked image trees
+data/
+*.ply
+*.rad
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.DS_Store

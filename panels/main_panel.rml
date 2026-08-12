@@ -1,0 +1,15 @@
+<rml>
+<head>
+  <link type="text/rcss" href="main_panel.rcss"/>
+</head>
+<body id="body" class="plugin-panel large_scene_trainer-panel">
+  <div class="panel-shell">
+    <div class="panel-header">
+      <span class="panel-kicker">Plugin Scaffold</span>
+      <span class="panel-title">Large Scene Trainer</span>
+      <span class="panel-note">RML and RCSS are set up already. Immediate widgets mount into the slot below.</span>
+    </div>
+    <div id="im-root"></div>
+  </div>
+</body>
+</rml>

@@ -1,0 +1,38 @@
+body.plugin-panel {
+    font-family: Inter;
+    padding: 0;
+}
+
+.panel-shell {
+    display: flex;
+    flex-direction: column;
+    gap: 12dp;
+    padding: 16dp;
+}
+
+.panel-header {
+    display: flex;
+    flex-direction: column;
+    gap: 4dp;
+}
+
+.panel-kicker {
+    color: #7fb8ff;
+    font-size: 12dp;
+    font-weight: bold;
+    letter-spacing: 0.8dp;
+    text-transform: uppercase;
+}
+
+.panel-title {
+    font-size: 18dp;
+    font-weight: bold;
+}
+
+.panel-note {
+    color: #a0a8b7;
+}
+
+#im-root {
+    width: 100%;
+}
