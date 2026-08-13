@@ -1,77 +1,27 @@
-"""Value types shared by the partitioner, manifest writer, and job generator.
-
-Plain dataclasses with explicit `to_dict`/`from_dict` rather than a serialisation
-library: the on-disk manifest is a stable contract that outlives this package's
-internals, so the mapping between them is written out by hand on purpose.
-"""
+"""Value types shared by trajectory fitting, partitioning, and manifests."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
 
-Vec3 = tuple[float, float, float]
 
-
-def _as_vec3(values: Sequence[float]) -> Vec3:
-    if len(values) != 3:
-        raise ValueError(f"expected 3 components, got {len(values)}")
-    return (float(values[0]), float(values[1]), float(values[2]))
-
-
-@dataclass(frozen=True)
-class AABB:
-    """Axis-aligned bounding box in world space."""
-
-    min: Vec3
-    max: Vec3
-
-    def __post_init__(self) -> None:
-        for lo, hi, axis in zip(self.min, self.max, "xyz"):
-            if hi < lo:
-                raise ValueError(f"AABB inverted on {axis}: {lo} > {hi}")
-
-    @property
-    def extent(self) -> Vec3:
-        return tuple(hi - lo for lo, hi in zip(self.min, self.max))  # type: ignore[return-value]
-
-    @property
-    def center(self) -> Vec3:
-        return tuple((lo + hi) / 2.0 for lo, hi in zip(self.min, self.max))  # type: ignore[return-value]
-
-    def contains(self, point: Sequence[float]) -> bool:
-        p = _as_vec3(point)
-        return all(lo <= c <= hi for lo, c, hi in zip(self.min, p, self.max))
-
-    def expanded(self, margin: float) -> AABB:
-        """Uniform dilation. Used to derive a context box from a core box."""
-        return AABB(
-            min=tuple(c - margin for c in self.min),  # type: ignore[arg-type]
-            max=tuple(c + margin for c in self.max),  # type: ignore[arg-type]
-        )
-
-    def intersects(self, other: AABB) -> bool:
-        return all(
-            self.min[i] <= other.max[i] and other.min[i] <= self.max[i] for i in range(3)
-        )
-
-    def to_dict(self) -> dict[str, list[float]]:
-        return {"min": list(self.min), "max": list(self.max)}
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> AABB:
-        return cls(min=_as_vec3(data["min"]), max=_as_vec3(data["max"]))
+def _array3(values: Sequence[float] | np.ndarray, field_name: str) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64)
+    if array.shape != (3,):
+        raise ValueError(f"{field_name} must have shape (3,), got {array.shape}")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{field_name} must contain only finite values")
+    array = array.copy()
+    array.setflags(write=False)
+    return array
 
 
 @dataclass(frozen=True)
 class CameraRef:
-    """The pose and intrinsics needed by trajectory partitioning.
-
-    ``R_world_cam`` follows COLMAP's convention: it maps world coordinates into
-    camera coordinates. Its rows are consequently the camera axes in world space.
-    """
+    """The pose and intrinsics needed by trajectory partitioning."""
 
     image_id: int
     name: str
@@ -84,12 +34,14 @@ class CameraRef:
     height: int
 
     def __post_init__(self) -> None:
-        centre = np.asarray(self.C_world, dtype=np.float64)
+        centre = _array3(self.C_world, "C_world")
         rotation = np.asarray(self.R_world_cam, dtype=np.float64)
-        if centre.shape != (3,):
-            raise ValueError(f"C_world must have shape (3,), got {centre.shape}")
         if rotation.shape != (3, 3):
             raise ValueError(f"R_world_cam must have shape (3, 3), got {rotation.shape}")
+        if not np.all(np.isfinite(rotation)):
+            raise ValueError("R_world_cam must contain only finite values")
+        rotation = rotation.copy()
+        rotation.setflags(write=False)
         object.__setattr__(self, "C_world", centre)
         object.__setattr__(self, "R_world_cam", rotation)
 
@@ -115,23 +67,22 @@ class GroundFrame:
 
     def __post_init__(self) -> None:
         rotation = np.asarray(self.R, dtype=np.float64)
-        origin = np.asarray(self.origin, dtype=np.float64)
         if rotation.shape != (3, 3):
             raise ValueError(f"R must have shape (3, 3), got {rotation.shape}")
-        if origin.shape != (3,):
-            raise ValueError(f"origin must have shape (3,), got {origin.shape}")
+        if not np.all(np.isfinite(rotation)):
+            raise ValueError("R must contain only finite values")
+        rotation = rotation.copy()
+        rotation.setflags(write=False)
         object.__setattr__(self, "R", rotation)
-        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "origin", _array3(self.origin, "origin"))
 
     def to_ground(self, pts_world: np.ndarray) -> np.ndarray:
-        """Transform one or more world-space points into ``(u, v, h)``."""
         points = np.asarray(pts_world, dtype=np.float64)
         if points.shape[-1:] != (3,):
             raise ValueError(f"points must end in dimension 3, got {points.shape}")
         return (points - self.origin) @ self.R.T
 
     def to_world(self, pts_ground: np.ndarray) -> np.ndarray:
-        """Transform one or more ``(u, v, h)`` points into world space."""
         points = np.asarray(pts_ground, dtype=np.float64)
         if points.shape[-1:] != (3,):
             raise ValueError(f"points must end in dimension 3, got {points.shape}")
@@ -190,61 +141,159 @@ class PlaneDiagnostics:
         }
 
 
-@dataclass
-class Block:
-    """One trainable unit: a core volume to keep, a context volume to train on.
+@dataclass(frozen=True)
+class BlockBox:
+    """Axis-aligned box in the oriented ``(u, v, h)`` ground frame."""
 
-    `core_box` tiles the scene without gaps and defines what survives the Phase 3
-    merge crop. `context_box` is the dilated region whose cameras and points feed
-    training, so blocks agree near their shared seams.
-    """
-
-    block_id: str
-    core_box: AABB
-    context_box: AABB
-    camera_ids: list[int] = field(default_factory=list)
+    min_g: np.ndarray
+    max_g: np.ndarray
 
     def __post_init__(self) -> None:
-        if not self.context_box.intersects(self.core_box):
-            raise ValueError(f"{self.block_id}: context box does not contain core box")
+        minimum = _array3(self.min_g, "min_g")
+        maximum = _array3(self.max_g, "max_g")
+        if np.any(maximum < minimum):
+            raise ValueError(f"BlockBox inverted: {minimum.tolist()} > {maximum.tolist()}")
+        object.__setattr__(self, "min_g", minimum)
+        object.__setattr__(self, "max_g", maximum)
+
+    def contains(self, pts_g: np.ndarray) -> np.ndarray:
+        """Inclusive geometric containment for one or more ground-frame points."""
+        points = np.asarray(pts_g, dtype=np.float64)
+        if points.shape == (3,):
+            points = points[None, :]
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"pts_g must have shape (N, 3), got {points.shape}")
+        return np.all((points >= self.min_g) & (points <= self.max_g), axis=1)
+
+    def overlaps(self, other: "BlockBox") -> bool:
+        return bool(np.all(self.overlap_extents(other) > 0.0))
+
+    def overlap_extents(self, other: "BlockBox") -> np.ndarray:
+        return np.minimum(self.max_g, other.max_g) - np.maximum(self.min_g, other.min_g)
+
+    @property
+    def extent(self) -> np.ndarray:
+        return self.max_g - self.min_g
+
+    def dilated(self, amounts: np.ndarray) -> "BlockBox":
+        margin = _array3(amounts, "amounts")
+        if np.any(margin < 0.0):
+            raise ValueError("dilation amounts must be non-negative")
+        return BlockBox(min_g=self.min_g - margin, max_g=self.max_g + margin)
+
+    def to_dict(self) -> dict[str, list[float]]:
+        return {"min_g": self.min_g.tolist(), "max_g": self.max_g.tolist()}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BlockBox":
+        return cls(
+            min_g=np.asarray(data["min_g"], dtype=np.float64),
+            max_g=np.asarray(data["max_g"], dtype=np.float64),
+        )
+
+
+@dataclass(frozen=True)
+class Block:
+    """A settled trainable block, authored entirely in ``GroundFrame`` coordinates."""
+
+    block_id: int
+    core: BlockBox
+    context: BlockBox
+    camera_indices: tuple[int, ...]
+    frame_span: tuple[int, int]
+    provenance: str
+
+    def __post_init__(self) -> None:
+        indices = tuple(int(index) for index in self.camera_indices)
+        if not indices:
+            raise ValueError("a block must own at least one camera")
+        if tuple(sorted(set(indices))) != indices:
+            raise ValueError("camera_indices must be sorted and unique")
+        span = tuple(int(index) for index in self.frame_span)
+        if len(span) != 2 or span[0] > span[1]:
+            raise ValueError("frame_span must be a (first, last) pair")
+        if not (
+            np.all(self.context.min_g <= self.core.min_g)
+            and np.all(self.context.max_g >= self.core.max_g)
+        ):
+            raise ValueError("context must contain the core")
+        if not self.provenance:
+            raise ValueError("provenance must not be empty")
+        object.__setattr__(self, "camera_indices", indices)
+        object.__setattr__(self, "frame_span", span)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "block_id": self.block_id,
-            "core_box": self.core_box.to_dict(),
-            "context_box": self.context_box.to_dict(),
-            "camera_ids": list(self.camera_ids),
+            "core": self.core.to_dict(),
+            "context": self.context.to_dict(),
+            "camera_indices": list(self.camera_indices),
+            "frame_span": list(self.frame_span),
+            "provenance": self.provenance,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Block:
+    def from_dict(cls, data: dict[str, Any]) -> "Block":
         return cls(
-            block_id=str(data["block_id"]),
-            core_box=AABB.from_dict(data["core_box"]),
-            context_box=AABB.from_dict(data["context_box"]),
-            camera_ids=[int(i) for i in data.get("camera_ids", [])],
+            block_id=int(data["block_id"]),
+            core=BlockBox.from_dict(data["core"]),
+            context=BlockBox.from_dict(data["context"]),
+            camera_indices=tuple(int(index) for index in data["camera_indices"]),
+            frame_span=tuple(int(index) for index in data["frame_span"]),
+            provenance=str(data["provenance"]),
         )
 
 
-@dataclass
-class BlockSet:
-    """The full partition of one scene. Produced by `core.partition`."""
+@dataclass(frozen=True)
+class SegmentationConfig:
+    core_extent_su: float
+    max_cameras_per_block: int
+    lateral_margin_su: float
+    context_margin_frac: float
+    z_pad_down_su: float
+    z_pad_up_su: float
+    merge_slack: float = 1.0
 
-    run_id: str
-    blocks: list[Block] = field(default_factory=list)
-    params: dict[str, Any] = field(default_factory=dict)
+    def __post_init__(self) -> None:
+        for name in (
+            "core_extent_su",
+            "lateral_margin_su",
+            "context_margin_frac",
+            "z_pad_down_su",
+            "z_pad_up_su",
+            "merge_slack",
+        ):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+            object.__setattr__(self, name, value)
+        if self.merge_slack < 1.0:
+            raise ValueError("merge_slack must be at least 1.0")
+        count = int(self.max_cameras_per_block)
+        if count < 3:
+            raise ValueError("max_cameras_per_block must be at least 3")
+        object.__setattr__(self, "max_cameras_per_block", count)
 
-    def __iter__(self):
-        return iter(self.blocks)
 
-    def __len__(self) -> int:
-        return len(self.blocks)
+@dataclass(frozen=True)
+class SegmentationDiagnostics:
+    n_blocks: int
+    cameras_per_block: list[int]
+    core_extents: list[tuple[float, float, float]]
+    actions: list[str]
+    orphan_cameras: int
+    multi_owned_cameras: int
+    grade_pct: float
+    warnings: list[str]
 
-    def block(self, block_id: str) -> Block:
-        for b in self.blocks:
-            if b.block_id == block_id:
-                return b
-        raise KeyError(block_id)
-
-    def assigned_camera_ids(self) -> set[int]:
-        return {cid for b in self.blocks for cid in b.camera_ids}
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "n_blocks": self.n_blocks,
+            "cameras_per_block": list(self.cameras_per_block),
+            "core_extents": [list(extent) for extent in self.core_extents],
+            "actions": list(self.actions),
+            "orphan_cameras": self.orphan_cameras,
+            "multi_owned_cameras": self.multi_owned_cameras,
+            "grade_pct": self.grade_pct,
+            "warnings": list(self.warnings),
+        }

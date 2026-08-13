@@ -7,7 +7,7 @@ import math
 
 import numpy as np
 
-from large_scene_trainer.core.trajectory_plane import fit_trajectory_plane
+from large_scene_trainer.core.trajectory_plane import build_ground_frame, fit_trajectory_plane
 from large_scene_trainer.core.types import CameraRef, GroundFrame
 
 
@@ -154,3 +154,23 @@ def test_frame_roundtrip_orthonormality_determinism_and_u_direction():
     restored = GroundFrame.from_dict(frame.to_dict())
     np.testing.assert_array_equal(restored.R, frame.R)
     np.testing.assert_array_equal(restored.origin, frame.origin)
+
+
+def test_closed_loop_u_sign_is_shape_independent():
+    """The largest-component rule avoids order-dependent loop orientation."""
+    cameras = []
+    for index, theta in enumerate(np.linspace(0.0, 2.0 * np.pi, 120, endpoint=False)):
+        centre = np.array([20.0 * math.cos(theta), 8.0 * math.sin(theta), 0.0])
+        tangent = np.array([-20.0 * math.sin(theta), 8.0 * math.cos(theta), 0.0])
+        cameras.append(make_camera(centre, tangent, image_id=index))
+    normal = np.array([0.0, 0.0, 1.0])
+    full = build_ground_frame(cameras, normal)
+    # Symmetrically remove samples so the loop's PCA axis is unchanged while
+    # exercising the subset path that used to depend on endpoint ordering.
+    subset = [camera for index, camera in enumerate(cameras) if index not in {0, 60}]
+    subset_frame = build_ground_frame(subset, normal)
+    shuffled = build_ground_frame(list(reversed(cameras)), normal)
+    np.testing.assert_allclose(full.R[0], subset_frame.R[0], atol=1e-12, rtol=0.0)
+    np.testing.assert_array_equal(full.R, shuffled.R)
+    largest = int(np.argmax(np.abs(full.R[0])))
+    assert full.R[0, largest] > 0.0

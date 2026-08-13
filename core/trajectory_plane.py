@@ -100,9 +100,10 @@ def build_ground_frame(cams: list[CameraRef], normal: np.ndarray) -> GroundFrame
     projected = offsets - np.outer(offsets @ h, h)
     _, _, vt = np.linalg.svd(projected, full_matrices=False)
     u = _unit(vt[0])
-    first_projection = float(np.dot(centres[0] - origin, u))
-    last_projection = float(np.dot(centres[-1] - origin, u))
-    if last_projection < first_projection:
+    # A capture can return near its start, making first-versus-last orientation
+    # numerically meaningless.  This component rule is independent of capture
+    # order and remains stable for closed loops.
+    if u[np.argmax(np.abs(u))] < 0.0:
         u = -u
     v = _unit(np.cross(h, u))
     u = _unit(np.cross(v, h))
