@@ -59,6 +59,37 @@ class CameraRef:
 
 
 @dataclass(frozen=True)
+class Point3D:
+    """One COLMAP sparse point, retained with its observation track."""
+
+    point3D_id: int
+    xyz: np.ndarray
+    rgb: np.ndarray
+    error: float
+    track: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        point_id = int(self.point3D_id)
+        if point_id < 0:
+            raise ValueError("point3D_id must be non-negative")
+        xyz = _array3(self.xyz, "xyz")
+        rgb = np.asarray(self.rgb, dtype=np.uint8)
+        if rgb.shape != (3,):
+            raise ValueError(f"rgb must have shape (3,), got {rgb.shape}")
+        rgb = rgb.copy()
+        rgb.setflags(write=False)
+        error = float(self.error)
+        if not np.isfinite(error):
+            raise ValueError("error must be finite")
+        track = tuple((int(image_id), int(point2d_idx)) for image_id, point2d_idx in self.track)
+        object.__setattr__(self, "point3D_id", point_id)
+        object.__setattr__(self, "xyz", xyz)
+        object.__setattr__(self, "rgb", rgb)
+        object.__setattr__(self, "error", error)
+        object.__setattr__(self, "track", track)
+
+
+@dataclass(frozen=True)
 class GroundFrame:
     """Right-handed trajectory frame with rows expressed in world space."""
 
