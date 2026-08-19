@@ -58,4 +58,9 @@ class MainPanel(lf.ui.Panel):
                 ui.text_disabled("Centre assignment is the conservative default.")
         if ui.button_styled("Export blocks", "primary"):
             self._operator.execute(None)
+        if ui.collapsing_header("Viewport preview", default_open=True):
+            ui.text_disabled("Cyan wireframes are cores; orange wireframes are contexts.")
+            ui.text_disabled("Reload the parent dataset to clear or refresh the preview.")
+            if ui.button("Show block boxes"):
+                self._operator.show_preview()
         ui.text_wrapped(self._operator.last_status)
