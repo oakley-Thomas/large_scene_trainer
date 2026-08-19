@@ -171,6 +171,47 @@ class PlaneDiagnostics:
             "warnings": list(self.warnings),
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PlaneDiagnostics":
+        """Restore diagnostics written by the trajectory diagnostics artifact."""
+        try:
+            return cls(
+                estimator_used=str(data["estimator_used"]),
+                normal_orientation=(
+                    None
+                    if data["normal_orientation"] is None
+                    else _array3(data["normal_orientation"], "normal_orientation")
+                ),
+                orientation_dispersion_deg=(
+                    None
+                    if data["orientation_dispersion_deg"] is None
+                    else float(data["orientation_dispersion_deg"])
+                ),
+                normal_pca=(
+                    None
+                    if data["normal_pca"] is None
+                    else _array3(data["normal_pca"], "normal_pca")
+                ),
+                pca_condition_ratio=(
+                    None
+                    if data["pca_condition_ratio"] is None
+                    else float(data["pca_condition_ratio"])
+                ),
+                pca_degenerate=bool(data["pca_degenerate"]),
+                agreement_deg=(
+                    None if data["agreement_deg"] is None else float(data["agreement_deg"])
+                ),
+                height_residual_rms=float(data["height_residual_rms"]),
+                height_residual_max=float(data["height_residual_max"]),
+                trajectory_arc_length=float(data["trajectory_arc_length"]),
+                median_inter_frame_spacing=float(data["median_inter_frame_spacing"]),
+                extent_ground=tuple(float(value) for value in data["extent_ground"]),
+                n_cameras=int(data["n_cameras"]),
+                warnings=[str(warning) for warning in data["warnings"]],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"malformed plane diagnostics: {exc}") from exc
+
 
 @dataclass(frozen=True)
 class BlockBox:

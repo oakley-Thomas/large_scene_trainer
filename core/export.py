@@ -26,7 +26,7 @@ from .colmap_io import (
     write_points3D_bin,
 )
 from .partition import partition_trajectory
-from .trajectory_plane import fit_trajectory_plane
+from .trajectory_diagnostics import load_trajectory_diagnostics
 from .types import Block, BlockBox, CameraRef, GroundFrame, Point3D, SegmentationConfig
 
 
@@ -305,7 +305,9 @@ def export_dataset(
     """Build and export blocks directly from a parent COLMAP dataset."""
     root, sparse_dir = _validate_dataset_root(dataset_root)
     cameras = load_cameras(sparse_dir)
-    frame, plane_diagnostics = fit_trajectory_plane(cameras)
+    trajectory = load_trajectory_diagnostics(root)
+    frame = trajectory.frame
+    plane_diagnostics = trajectory.diagnostics
     blocks, _ = partition_trajectory(cameras, frame, plane_diagnostics, segmentation_config)
     assigned_blocks, assignment = assign_cameras(cameras, blocks, frame, assignment_config)
     return export_blocks(

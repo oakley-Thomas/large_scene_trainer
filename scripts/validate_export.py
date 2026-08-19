@@ -23,6 +23,8 @@ import sys
 import uuid
 from typing import Iterable
 
+import numpy as np
+
 
 # The checkout directory is the package; Python needs its parent on sys.path
 # when this file is launched directly as ``python scripts/validate_export.py``.
@@ -40,11 +42,27 @@ from large_scene_trainer.core.export import (
     export_dataset,
 )
 from large_scene_trainer.core.partition import config_from_diagnostics
-from large_scene_trainer.core.trajectory_plane import fit_trajectory_plane
+from large_scene_trainer.core.trajectory_diagnostics import load_trajectory_diagnostics
 
 
 class GateError(RuntimeError):
     """Raised when an exported block fails a G1 acceptance check."""
+
+
+def _ground_frames_match(actual: object, expected: dict) -> bool:
+    """Compare persisted frame values, allowing JSON float round-off in old exports."""
+    if not isinstance(actual, dict):
+        return False
+    if set(expected) <= {"version"}:
+        return actual == expected
+    try:
+        return (
+            actual.get("version") == expected.get("version")
+            and np.allclose(actual["R"], expected["R"], rtol=0.0, atol=1e-12)
+            and np.allclose(actual["origin"], expected["origin"], rtol=0.0, atol=1e-12)
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _sha256(path: Path) -> str:
@@ -132,7 +150,7 @@ def verify_export(
             raise GateError(
                 f"block {block_dir.name} images symlink does not resolve to parent images"
             )
-        if manifest.get("ground_frame") != expected_frame:
+        if not _ground_frames_match(manifest.get("ground_frame"), expected_frame):
             raise GateError(f"block {block_dir.name} ground frame differs from the source frame")
         counts = manifest.get("counts", {})
         point_count = counts.get("points3D")
@@ -217,6 +235,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.target_blocks < 1 or args.min_cameras_per_block < 1 or args.iterations < 1:
         parser.error("target blocks, minimum cameras, and iterations must be positive")
+    if args.verify_determinism and args.skip_export:
+        parser.error("--verify-determinism cannot be combined with --skip-export")
     return args
 
 
@@ -236,13 +256,20 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=False)
 
     cameras = load_cameras(dataset_root / "sparse" / "0")
-    frame, diagnostics = fit_trajectory_plane(cameras)
+    trajectory = load_trajectory_diagnostics(dataset_root)
+    frame = trajectory.frame
+    diagnostics = trajectory.diagnostics
     config = config_from_diagnostics(diagnostics, target_blocks=args.target_blocks)
     assignment = CameraAssignmentConfig(
         predicate="centre", min_cameras_per_block=args.min_cameras_per_block
     )
     blocks_dir = dataset_root / BLOCKS_DIRNAME
+    prior_export_backup: Path | None = None
     try:
+        if args.verify_determinism and blocks_dir.exists():
+            prior_export_backup = dataset_root / f"{BLOCKS_DIRNAME}.pre-g1-{uuid.uuid4().hex}"
+            blocks_dir.replace(prior_export_backup)
+            print(f"Saved prior export before deterministic passes: {prior_export_backup}")
         if not args.skip_export:
             print(f"Exporting {args.target_blocks}-target block dataset to {blocks_dir}")
             export_dataset(dataset_root, config, assignment)
@@ -260,6 +287,8 @@ def main() -> int:
                 raise
             else:
                 shutil.rmtree(backup_dir)
+                if prior_export_backup is not None:
+                    shutil.rmtree(prior_export_backup)
                 print("Determinism check passed")
             block_dirs = verify_export(
                 dataset_root, frame.to_dict(), {camera.image_id for camera in cameras}

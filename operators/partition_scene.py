@@ -8,10 +8,20 @@ import lichtfeld as lf
 from lfs_plugins.props import EnumProperty, FloatProperty, IntProperty, StringProperty
 from lfs_plugins.types import Operator
 
+from ..adapters.viewport_preview import (
+    ViewportPreviewError,
+    show_block_preview,
+)
+from ..core.assignment_report import BlockAssignmentRow, block_assignment_rows
 from ..core.camera_assign import CameraAssignmentConfig, frustum_config_from_diagnostics
 from ..core.colmap_io import load_cameras
 from ..core.export import ExportError, export_dataset
 from ..core.partition import config_from_diagnostics
+from ..core.preview_layout import PreviewLayoutError, load_exported_layout
+from ..core.trajectory_diagnostics import (
+    load_trajectory_diagnostics,
+    write_trajectory_diagnostics,
+)
 from ..core.trajectory_plane import fit_trajectory_plane
 from ..core.types import SegmentationConfig
 
@@ -57,6 +67,8 @@ class PartitionScene(Operator):
     def __init__(self) -> None:
         super().__init__()
         self._validated_root: Path | None = None
+        self._preview_blocks = ()
+        self._preview_frame = None
         self.last_status = "Choose a parent dataset and validate it."
 
     @classmethod
@@ -101,7 +113,8 @@ class PartitionScene(Operator):
         try:
             root = self._root()
             cameras = load_cameras(root / "sparse" / "0")
-            _, diagnostics = fit_trajectory_plane(cameras)
+            frame, diagnostics = fit_trajectory_plane(cameras)
+            write_trajectory_diagnostics(root, frame, diagnostics)
             defaults = config_from_diagnostics(diagnostics, target_blocks=self.target_blocks)
             for field in (
                 "core_extent_su",
@@ -115,7 +128,7 @@ class PartitionScene(Operator):
                 setattr(self, field, getattr(defaults, field))
             self._validated_root = root
             self.last_status = (
-                f"Validated {len(cameras):,} images; arc length "
+                f"Validated {len(cameras):,} images; wrote canonical frame; arc length "
                 f"{diagnostics.trajectory_arc_length:.6g} scene units."
             )
             lf.log.info(f"PartitionScene: {self.last_status}")
@@ -133,13 +146,14 @@ class PartitionScene(Operator):
                 raise ExportError(
                     "validate this dataset before exporting so controls have scene-unit defaults"
                 )
-            cameras = load_cameras(root / "sparse" / "0")
-            _, diagnostics = fit_trajectory_plane(cameras)
+            diagnostics = load_trajectory_diagnostics(root).diagnostics
             summary = export_dataset(
                 root,
                 self._segmentation_config(),
                 self._assignment_config(diagnostics),
             )
+            self._preview_blocks = summary.blocks_definition
+            self._preview_frame = summary.ground_frame
             self.last_status = (
                 f"Exported {len(summary.blocks)} blocks to {summary.blocks_dir}; "
                 f"assignment={summary.assignment.predicate}; "
@@ -151,3 +165,44 @@ class PartitionScene(Operator):
             self.last_status = f"Export failed: {exc}"
             lf.log.error(f"PartitionScene: {self.last_status}")
             return {"CANCELLED"}
+
+    @property
+    def has_preview_data(self) -> bool:
+        """Whether this session has a successfully exported block layout."""
+        return bool(self._preview_blocks and self._preview_frame is not None)
+
+    def assignment_rows(self) -> tuple[BlockAssignmentRow, ...]:
+        """Return a panel-ready summary from this or a prior successful export."""
+        if not self.has_preview_data:
+            try:
+                self._preview_blocks, self._preview_frame = load_exported_layout(self._root())
+            except (OSError, ValueError, PreviewLayoutError):
+                return ()
+        return block_assignment_rows(self._preview_blocks)
+
+    def show_preview(self) -> bool:
+        """Draw core and context wireframes in the currently loaded parent scene."""
+        if not self.has_preview_data:
+            try:
+                self._preview_blocks, self._preview_frame = load_exported_layout(self._root())
+            except (OSError, ValueError, PreviewLayoutError) as exc:
+                self.last_status = f"Preview failed: {exc}"
+                lf.log.error(f"PartitionScene: {self.last_status}")
+                return False
+        try:
+            summary = show_block_preview(self._preview_blocks, self._preview_frame)
+            if summary.already_visible:
+                self.last_status = (
+                    "Block preview is already visible; reload the parent dataset to refresh it."
+                )
+            else:
+                self.last_status = (
+                    f"Viewport preview: {summary.block_count} blocks; cyan=core, "
+                    f"orange=context. Reload the parent dataset to clear it."
+                )
+            lf.log.info(f"PartitionScene: {self.last_status}")
+            return True
+        except ViewportPreviewError as exc:
+            self.last_status = f"Preview failed: {exc}"
+            lf.log.error(f"PartitionScene: {self.last_status}")
+            return False

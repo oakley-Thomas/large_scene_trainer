@@ -32,7 +32,7 @@ from large_scene_trainer.core.camera_assign import (
 )
 from large_scene_trainer.core.colmap_io import load_cameras
 from large_scene_trainer.core.partition import config_from_diagnostics, partition_trajectory
-from large_scene_trainer.core.trajectory_plane import fit_trajectory_plane
+from large_scene_trainer.core.trajectory_diagnostics import load_trajectory_diagnostics
 
 
 # Start below the smallest observed block extent, then extend through the
@@ -78,7 +78,9 @@ def main() -> int:
 
     sparse_dir = args.dataset_root.expanduser().resolve() / "sparse" / "0"
     cameras = load_cameras(sparse_dir)
-    frame, plane_diagnostics = fit_trajectory_plane(cameras)
+    trajectory = load_trajectory_diagnostics(args.dataset_root)
+    frame = trajectory.frame
+    plane_diagnostics = trajectory.diagnostics
     segmentation_config = config_from_diagnostics(
         plane_diagnostics, target_blocks=args.target_blocks
     )
