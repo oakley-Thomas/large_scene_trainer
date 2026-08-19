@@ -16,6 +16,12 @@ from ..core.assignment_report import BlockAssignmentRow, block_assignment_rows
 from ..core.camera_assign import CameraAssignmentConfig, frustum_config_from_diagnostics
 from ..core.colmap_io import load_cameras
 from ..core.export import ExportError, export_dataset
+from ..core.job_generation import (
+    JobGenerationConfig,
+    JobGenerationError,
+    TRAINING_STRATEGIES,
+    generate_jobs,
+)
 from ..core.partition import config_from_diagnostics
 from ..core.preview_layout import PreviewLayoutError, load_exported_layout
 from ..core.trajectory_diagnostics import (
@@ -62,6 +68,24 @@ class PartitionScene(Operator):
         min=0.0,
         name="Frustum far plane (scene units)",
         description="Required for frustum assignment; select it with tune_frustum_far.py",
+    )
+    training_strategy = EnumProperty(
+        items=[
+            (strategy, strategy, f"Use LichtFeld's {strategy} optimization strategy")
+            for strategy in TRAINING_STRATEGIES
+        ],
+        default="mrnf",
+        name="Training strategy",
+    )
+    max_cap_per_camera = IntProperty(
+        default=3_000,
+        min=1,
+        name="Maximum Gaussians per camera",
+    )
+    max_width = IntProperty(
+        default=3_840,
+        min=0,
+        name="Training maximum image width",
     )
 
     def __init__(self) -> None:
@@ -204,5 +228,26 @@ class PartitionScene(Operator):
             return True
         except ViewportPreviewError as exc:
             self.last_status = f"Preview failed: {exc}"
+            lf.log.error(f"PartitionScene: {self.last_status}")
+            return False
+
+    def generate_training_jobs(self) -> bool:
+        """Publish portable worker jobs from an existing block export."""
+        try:
+            summary = generate_jobs(
+                self._root(),
+                JobGenerationConfig(
+                    strategy=self.training_strategy,
+                    max_cap_per_camera=self.max_cap_per_camera,
+                    max_width=self.max_width,
+                ),
+            )
+            self.last_status = (
+                f"Generated {len(summary.jobs)} portable training jobs: {summary.job_file}"
+            )
+            lf.log.info(f"PartitionScene: {self.last_status}")
+            return True
+        except (OSError, ValueError, JobGenerationError) as exc:
+            self.last_status = f"Job generation failed: {exc}"
             lf.log.error(f"PartitionScene: {self.last_status}")
             return False
