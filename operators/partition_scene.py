@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import lichtfeld as lf
-from lfs_plugins.props import FloatProperty, IntProperty, StringProperty
+from lfs_plugins.props import EnumProperty, FloatProperty, IntProperty, StringProperty
 from lfs_plugins.types import Operator
 
-from ..core.camera_assign import CameraAssignmentConfig
+from ..core.camera_assign import CameraAssignmentConfig, frustum_config_from_diagnostics
 from ..core.colmap_io import load_cameras
 from ..core.export import ExportError, export_dataset
 from ..core.partition import config_from_diagnostics
@@ -35,6 +35,24 @@ class PartitionScene(Operator):
     z_pad_up_su = FloatProperty(default=1.0, min=1e-12, name="Upward z padding (scene units)")
     merge_slack = FloatProperty(default=1.0, min=1.0, name="Merge slack")
     min_cameras_per_block = IntProperty(default=32, min=1, name="Minimum assigned cameras")
+    camera_assignment_predicate = EnumProperty(
+        items=[
+            ("centre", "Centre inside context", "Conservative fallback assignment"),
+            (
+                "frustum",
+                "Frustum intersects context",
+                "Use only after tuning the far plane for this dataset",
+            ),
+        ],
+        default="centre",
+        name="Camera assignment",
+    )
+    frustum_far_su = FloatProperty(
+        default=0.0,
+        min=0.0,
+        name="Frustum far plane (scene units)",
+        description="Required for frustum assignment; select it with tune_frustum_far.py",
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -60,6 +78,22 @@ class PartitionScene(Operator):
             z_pad_down_su=self.z_pad_down_su,
             z_pad_up_su=self.z_pad_up_su,
             merge_slack=self.merge_slack,
+        )
+
+    def _assignment_config(self, diagnostics) -> CameraAssignmentConfig:
+        """Build the selected assignment mode from the current dataset diagnostics."""
+        if self.camera_assignment_predicate == "centre":
+            return CameraAssignmentConfig(
+                predicate="centre", min_cameras_per_block=self.min_cameras_per_block
+            )
+        if self.frustum_far_su <= 0.0:
+            raise ExportError(
+                "set a positive Frustum far plane from tune_frustum_far.py before exporting"
+            )
+        return frustum_config_from_diagnostics(
+            diagnostics,
+            frustum_far_su=self.frustum_far_su,
+            min_cameras_per_block=self.min_cameras_per_block,
         )
 
     def validate_dataset(self) -> bool:
@@ -99,15 +133,16 @@ class PartitionScene(Operator):
                 raise ExportError(
                     "validate this dataset before exporting so controls have scene-unit defaults"
                 )
+            cameras = load_cameras(root / "sparse" / "0")
+            _, diagnostics = fit_trajectory_plane(cameras)
             summary = export_dataset(
                 root,
                 self._segmentation_config(),
-                CameraAssignmentConfig(
-                    predicate="centre", min_cameras_per_block=self.min_cameras_per_block
-                ),
+                self._assignment_config(diagnostics),
             )
             self.last_status = (
                 f"Exported {len(summary.blocks)} blocks to {summary.blocks_dir}; "
+                f"assignment={summary.assignment.predicate}; "
                 f"bind-mount {summary.dataset_root} for training."
             )
             lf.log.info(f"PartitionScene: {self.last_status}")
