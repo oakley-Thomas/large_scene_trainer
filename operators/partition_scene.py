@@ -22,6 +22,7 @@ from ..core.job_generation import (
     TRAINING_STRATEGIES,
     generate_jobs,
 )
+from ..core.gpu_workers import WorkerRunnerError, load_job_status
 from ..core.partition import config_from_diagnostics
 from ..core.preview_layout import PreviewLayoutError, load_exported_layout
 from ..core.trajectory_diagnostics import (
@@ -86,6 +87,12 @@ class PartitionScene(Operator):
         default=3_840,
         min=0,
         name="Training maximum image width",
+    )
+    training_run_dir = StringProperty(
+        default="",
+        subtype="DIR_PATH",
+        name="Training run directory",
+        description="Optional run directory created by scripts/run_gpu_workers.py",
     )
 
     def __init__(self) -> None:
@@ -251,3 +258,13 @@ class PartitionScene(Operator):
             self.last_status = f"Job generation failed: {exc}"
             lf.log.error(f"PartitionScene: {self.last_status}")
             return False
+
+    def job_status_rows(self):
+        """Return jobs plus their current queue state for the panel."""
+        try:
+            run_dir = self.training_run_dir.strip() or None
+            return load_job_status(self._root(), run_dir)
+        except (OSError, ValueError, WorkerRunnerError) as exc:
+            self.last_status = f"Job-status read failed: {exc}"
+            lf.log.error(f"PartitionScene: {self.last_status}")
+            return ()

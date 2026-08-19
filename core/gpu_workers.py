@@ -490,6 +490,54 @@ class RunSummary:
         )
 
 
+@dataclass(frozen=True)
+class JobStatus:
+    """Panel-ready status of one generated job and its latest queue state."""
+
+    job_id: str
+    block_id: int
+    camera_count: int | None
+    state: str
+    exit_code: int | None
+
+
+def load_job_status(dataset_root: str | Path, run_dir: str | Path | None) -> tuple[JobStatus, ...]:
+    """Read generated jobs plus optional run state without modifying either tree."""
+    jobs = load_jobs(dataset_root)
+    states: dict[str, dict[str, Any]] = {}
+    if run_dir:
+        queue = QueueStore(run_dir)
+        if queue.queue_dir.is_dir():
+            for state_name in QUEUE_STATES:
+                state_dir = queue._state_dir(state_name)
+                for path in state_dir.glob("*.json"):
+                    state = _read_json(path, f"{state_name} queue state")
+                    if state.get("state") != state_name:
+                        raise WorkerRunnerError(
+                            f"queue state file disagrees with its directory: {path}"
+                        )
+                    if path.stem in states:
+                        raise WorkerRunnerError(f"queue has duplicate state for job {path.stem!r}")
+                    states[path.stem] = state
+    rows: list[JobStatus] = []
+    for job in jobs:
+        state = states.get(job.job_id, {})
+        camera_count = job.raw.get("camera_count")
+        rows.append(
+            JobStatus(
+                job_id=job.job_id,
+                block_id=job.block_id,
+                camera_count=camera_count if isinstance(camera_count, int) else None,
+                state=str(state.get("state", "not started")),
+                exit_code=state.get("exit_code") if isinstance(state.get("exit_code"), int) else None,
+            )
+        )
+    unexpected = sorted(set(states) - {job.job_id for job in jobs})
+    if unexpected:
+        raise WorkerRunnerError(f"queue contains state for unknown job {unexpected[0]!r}")
+    return tuple(rows)
+
+
 def _worker_loop(
     queue: QueueStore, config: LaunchConfig, mode: str, mount_ancestor: Path, gpu_id: str
 ) -> None:

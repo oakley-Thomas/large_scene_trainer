@@ -12,6 +12,7 @@ from large_scene_trainer.core.gpu_workers import (
     QueueStore,
     WorkerRunnerError,
     build_launch_command,
+    load_job_status,
     load_jobs,
     parse_gpu_ids,
     resolve_mount_ancestor,
@@ -204,3 +205,20 @@ def test_parse_gpu_ids_rejects_empty_and_duplicate_values():
         parse_gpu_ids("0,0")
     with pytest.raises(WorkerRunnerError, match="comma-separated"):
         parse_gpu_ids(" , ")
+
+
+def test_load_job_status_combines_jobs_with_read_only_queue_state(tmp_path):
+    dataset = tmp_path / "dataset"
+    _write_jobs(dataset)
+    jobs = load_jobs(dataset)
+    queue = QueueStore(tmp_path / "run")
+    queue.initialize(jobs, dataset.resolve(), retry_failed=False)
+    job, running_path = queue.claim("worker", "0")
+    queue.complete(running_path, command=["true"], log_path=tmp_path / "job.log", exit_code=0)
+
+    rows = load_job_status(dataset, tmp_path / "run")
+
+    assert [(row.job_id, row.state, row.exit_code) for row in rows] == [
+        (job.job_id, "succeeded", 0),
+        ("block_001", "pending", None),
+    ]
