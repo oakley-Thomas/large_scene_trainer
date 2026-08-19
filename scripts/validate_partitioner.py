@@ -31,6 +31,7 @@ from large_scene_trainer.core import manifest
 from large_scene_trainer.core.colmap_io import load_cameras
 from large_scene_trainer.core.export import BLOCKS_DIRNAME, MIN_POINT_FRACTION, MIN_POINTS_PER_BLOCK
 from large_scene_trainer.core.preview_layout import load_exported_layout
+from large_scene_trainer.core.trajectory_diagnostics import load_trajectory_diagnostics
 from large_scene_trainer.core.types import Block, CameraRef, GroundFrame
 
 
@@ -152,6 +153,11 @@ def main() -> int:
     args = parse_args()
     root = args.dataset_root.expanduser().resolve()
     blocks, frame = load_exported_layout(root)
+    canonical_frame = load_trajectory_diagnostics(root).frame
+    if frame.to_dict() != canonical_frame.to_dict():
+        raise PartitionerValidationError(
+            "block manifests do not use the persisted ticket-1.1 ground frame"
+        )
     cameras = load_cameras(root / "sparse" / "0")
     assignment_counts, core_counts = validate_camera_partition(blocks, cameras, frame)
     point_rows = validate_point_counts(

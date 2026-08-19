@@ -8,6 +8,7 @@ import json
 
 from large_scene_trainer.scripts.validate_export import (
     GateError,
+    _ground_frames_match,
     assert_same_tree,
     tree_fingerprint,
     verify_export,
@@ -56,3 +57,23 @@ def test_verify_export_accepts_parent_images_symlink(tmp_path):
         json.dumps({"blocks": [{"directory": "block_000"}]}), encoding="utf-8"
     )
     assert verify_export(dataset_root, {"version": 1}, {7}) == [block_dir]
+
+
+def test_ground_frame_comparison_allows_json_roundoff_but_not_changes():
+    expected = {
+        "version": 1,
+        "R": [[0.141108642530448]],
+        "origin": [-0.04774089762934331],
+    }
+    legacy = {
+        "version": 1,
+        "R": [[0.14110864253044808]],
+        "origin": [-0.04774089762934331],
+    }
+    changed = {
+        "version": 1,
+        "R": [[0.141108642540448]],
+        "origin": [-0.04774089762934331],
+    }
+    assert _ground_frames_match(legacy, expected)
+    assert not _ground_frames_match(changed, expected)

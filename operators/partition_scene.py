@@ -18,6 +18,10 @@ from ..core.colmap_io import load_cameras
 from ..core.export import ExportError, export_dataset
 from ..core.partition import config_from_diagnostics
 from ..core.preview_layout import PreviewLayoutError, load_exported_layout
+from ..core.trajectory_diagnostics import (
+    load_trajectory_diagnostics,
+    write_trajectory_diagnostics,
+)
 from ..core.trajectory_plane import fit_trajectory_plane
 from ..core.types import SegmentationConfig
 
@@ -109,7 +113,8 @@ class PartitionScene(Operator):
         try:
             root = self._root()
             cameras = load_cameras(root / "sparse" / "0")
-            _, diagnostics = fit_trajectory_plane(cameras)
+            frame, diagnostics = fit_trajectory_plane(cameras)
+            write_trajectory_diagnostics(root, frame, diagnostics)
             defaults = config_from_diagnostics(diagnostics, target_blocks=self.target_blocks)
             for field in (
                 "core_extent_su",
@@ -123,7 +128,7 @@ class PartitionScene(Operator):
                 setattr(self, field, getattr(defaults, field))
             self._validated_root = root
             self.last_status = (
-                f"Validated {len(cameras):,} images; arc length "
+                f"Validated {len(cameras):,} images; wrote canonical frame; arc length "
                 f"{diagnostics.trajectory_arc_length:.6g} scene units."
             )
             lf.log.info(f"PartitionScene: {self.last_status}")
@@ -141,8 +146,7 @@ class PartitionScene(Operator):
                 raise ExportError(
                     "validate this dataset before exporting so controls have scene-unit defaults"
                 )
-            cameras = load_cameras(root / "sparse" / "0")
-            _, diagnostics = fit_trajectory_plane(cameras)
+            diagnostics = load_trajectory_diagnostics(root).diagnostics
             summary = export_dataset(
                 root,
                 self._segmentation_config(),
