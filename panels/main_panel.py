@@ -65,6 +65,38 @@ class MainPanel(lf.ui.Panel):
             ui.text_disabled("Writes portable jobs.json; it does not start training.")
             if ui.button("Generate jobs"):
                 self._operator.generate_training_jobs()
+        if ui.collapsing_header("Training status", default_open=True):
+            changed, path = ui.path_input(
+                "Training run directory",
+                self._operator.training_run_dir,
+                folder_mode=True,
+                dialog_title="GPU worker run directory",
+            )
+            if changed:
+                self._operator.training_run_dir = path
+            rows = self._operator.job_status_rows()
+            if not rows:
+                ui.text_disabled("Generate jobs first, then select an optional training run directory.")
+            elif ui.begin_table("block_training_status", 5):
+                ui.table_setup_column("Block")
+                ui.table_setup_column("Job")
+                ui.table_setup_column("Cameras")
+                ui.table_setup_column("State")
+                ui.table_setup_column("Exit")
+                ui.table_headers_row()
+                for row in rows:
+                    ui.table_next_row()
+                    ui.table_next_column()
+                    ui.label(str(row.block_id))
+                    ui.table_next_column()
+                    ui.label(row.job_id)
+                    ui.table_next_column()
+                    ui.label("—" if row.camera_count is None else str(row.camera_count))
+                    ui.table_next_column()
+                    ui.label(row.state)
+                    ui.table_next_column()
+                    ui.label("—" if row.exit_code is None else str(row.exit_code))
+                ui.end_table()
         if ui.collapsing_header("Viewport preview", default_open=True):
             ui.text_disabled("Cyan wireframes are cores; orange wireframes are contexts.")
             ui.text_disabled("Reload the parent dataset to clear or refresh the preview.")
