@@ -170,7 +170,10 @@ def _manifest_data(
                 **source_hashes,
             },
             "counts": {
-                "cameras": cameras_count,
+                # Training budgets scale with camera poses/images, not the often
+                # single shared COLMAP intrinsics record in cameras.bin.
+                "cameras": len(images),
+                "camera_models": cameras_count,
                 "images": len(images),
                 "points3D": points_count,
                 "points3D_parent": parent_point_count,

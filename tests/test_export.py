@@ -118,6 +118,8 @@ def test_export_determinism_symlink_manifest_and_reload(tmp_path):
     data = json.loads((block_dir / "manifest.json").read_text())
     assert data["ground_frame"] == _frame().to_dict()
     assert data["generator"]["points2D_mode"] == "zeroed"
+    assert data["counts"]["cameras"] == 2
+    assert data["counts"]["camera_models"] == 1
     assert data["counts"]["points3D"] == 1200
     assert len(data["source"]["points3D_sha256"]) == hashlib.sha256().digest_size * 2
     assert json.loads((first.blocks_dir / "index.json").read_text())["blocks"] == [

@@ -58,6 +58,13 @@ class MainPanel(lf.ui.Panel):
                 ui.text_disabled("Centre assignment is the conservative default.")
         if ui.button_styled("Export blocks", "primary"):
             self._operator.execute(None)
+        if ui.collapsing_header("Training jobs", default_open=True):
+            ui.prop(self._operator, "training_strategy")
+            ui.prop(self._operator, "max_cap_per_camera")
+            ui.prop(self._operator, "max_width")
+            ui.text_disabled("Writes portable jobs.json; it does not start training.")
+            if ui.button("Generate jobs"):
+                self._operator.generate_training_jobs()
         if ui.collapsing_header("Viewport preview", default_open=True):
             ui.text_disabled("Cyan wireframes are cores; orange wireframes are contexts.")
             ui.text_disabled("Reload the parent dataset to clear or refresh the preview.")
