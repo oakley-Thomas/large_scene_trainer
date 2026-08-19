@@ -31,15 +31,15 @@ def build(
     plugin_version: str,
     source_scene: str,
     params: dict[str, Any] | None = None,
+    include_created: bool = True,
 ) -> dict[str, Any]:
     """Assemble one schema-v2 manifest without touching the filesystem."""
     if block.block_id < 0:
         raise ManifestError("cannot serialize a provisional block before final IDs are assigned")
-    return {
+    data = {
         "schema": SCHEMA_VERSION,
         "block_id": block.block_id,
         "run_id": run_id,
-        "created": _utc_now(),
         "plugin_version": plugin_version,
         "source_scene": source_scene,
         "ground_frame": ground_frame.to_dict(),
@@ -51,6 +51,9 @@ def build(
         "camera_count": len(block.camera_indices),
         "params": dict(params or {}),
     }
+    if include_created:
+        data["created"] = _utc_now()
+    return data
 
 
 _REQUIRED_KEYS = (
@@ -110,7 +113,9 @@ def save(data: dict[str, Any], directory: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / MANIFEST_NAME
     tmp = target.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.write_text(
+        json.dumps(data, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8"
+    )
     tmp.replace(target)
     return target
 
