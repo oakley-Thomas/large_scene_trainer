@@ -63,4 +63,28 @@ class MainPanel(lf.ui.Panel):
             ui.text_disabled("Reload the parent dataset to clear or refresh the preview.")
             if ui.button("Show block boxes"):
                 self._operator.show_preview()
+        if ui.collapsing_header("Assignment table", default_open=True):
+            rows = self._operator.assignment_rows()
+            if not rows:
+                ui.text_disabled("No existing block export selected.")
+            elif ui.begin_table("block_assignment_summary", 4):
+                ui.table_setup_column("Block")
+                ui.table_setup_column("Cameras")
+                ui.table_setup_column("Frame span")
+                ui.table_setup_column("Core extent (u, v, h)")
+                ui.table_headers_row()
+                for row in rows:
+                    ui.table_next_row()
+                    ui.table_next_column()
+                    ui.label(str(row.block_id))
+                    ui.table_next_column()
+                    ui.label(str(row.camera_count))
+                    ui.table_next_column()
+                    ui.label(f"{row.frame_start}–{row.frame_end}")
+                    ui.table_next_column()
+                    extent = tuple(
+                        maximum - minimum for minimum, maximum in zip(row.core_min, row.core_max)
+                    )
+                    ui.label(" × ".join(f"{value:.3g}" for value in extent))
+                ui.end_table()
         ui.text_wrapped(self._operator.last_status)

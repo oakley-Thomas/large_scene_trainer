@@ -12,6 +12,7 @@ from ..adapters.viewport_preview import (
     ViewportPreviewError,
     show_block_preview,
 )
+from ..core.assignment_report import BlockAssignmentRow, block_assignment_rows
 from ..core.camera_assign import CameraAssignmentConfig, frustum_config_from_diagnostics
 from ..core.colmap_io import load_cameras
 from ..core.export import ExportError, export_dataset
@@ -165,6 +166,15 @@ class PartitionScene(Operator):
     def has_preview_data(self) -> bool:
         """Whether this session has a successfully exported block layout."""
         return bool(self._preview_blocks and self._preview_frame is not None)
+
+    def assignment_rows(self) -> tuple[BlockAssignmentRow, ...]:
+        """Return a panel-ready summary from this or a prior successful export."""
+        if not self.has_preview_data:
+            try:
+                self._preview_blocks, self._preview_frame = load_exported_layout(self._root())
+            except (OSError, ValueError, PreviewLayoutError):
+                return ()
+        return block_assignment_rows(self._preview_blocks)
 
     def show_preview(self) -> bool:
         """Draw core and context wireframes in the currently loaded parent scene."""
