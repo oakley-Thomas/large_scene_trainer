@@ -10,12 +10,11 @@ WHAT IS LANDED NOW
 camera centre inside the context box. This is functional — 1.4 can export real
 blocks against it today.
 
-WHAT 1.3 STILL OWES
--------------------
-`_frustum_intersects_box()` currently raises. Implementing it and flipping
-`CameraAssignmentConfig.predicate` to "frustum" is the whole of 1.3's remaining
-work. No signature changes. No new fields. If frustum intersection does not land
-by the G1 gate, "centre" ships and nothing downstream notices.
+DEPLOYMENT DEFAULT
+------------------
+The frustum predicate is available, but `CameraAssignmentConfig.predicate`
+remains "centre" until a scene-specific far-plane sweep meets the training-cost
+gate. Both predicates share the same `Block.camera_indices` interface.
 
 TWO MEMBERSHIP RELATIONS — DO NOT CONFLATE THEM
 -----------------------------------------------
@@ -50,7 +49,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .types import Block, BlockBox, CameraRef, GroundFrame
+from .types import Block, BlockBox, CameraRef, GroundFrame, PlaneDiagnostics
+
+
+# CameraRef intentionally carries only focal lengths and image dimensions. The
+# small inflation covers the absent principal point without changing that
+# cross-ticket interface.
+_FOV_INFLATE = 1.05
+_SAT_EPSILON_SCALE = 1e-12
 
 
 @dataclass(frozen=True)
@@ -60,8 +66,8 @@ class CameraAssignmentConfig:
     predicate:
         "centre"  — camera centre inside the context box. Ticket 1.3's stated
                     fallback. Implemented, deterministic, cheap.
-        "frustum" — camera frustum intersects the context box. Ticket 1.3's
-                    target. Not yet implemented.
+        "frustum" — camera frustum intersects the context box, unioned with
+                    camera-centre membership to preserve core ownership.
 
     frustum_near_su / frustum_far_su:
         Near and far planes of the truncated frustum, in scene units. Only read
@@ -111,6 +117,29 @@ class AssignmentDiagnostics:
         return d
 
 
+def frustum_config_from_diagnostics(
+    diagnostics: PlaneDiagnostics,
+    *,
+    frustum_far_su: float,
+    min_cameras_per_block: int = 32,
+) -> CameraAssignmentConfig:
+    """Build a frustum configuration from 1.1's scene-unit diagnostics.
+
+    The near plane is tied to capture spacing, not a world-unit literal.
+    ``frustum_far_su`` remains explicit because its safe value must be selected
+    from a measured assignment sweep for each scene.
+    """
+    near = float(diagnostics.median_inter_frame_spacing)
+    if not np.isfinite(near) or near <= 0.0:
+        raise ValueError("median_inter_frame_spacing must be finite and positive")
+    return CameraAssignmentConfig(
+        predicate="frustum",
+        frustum_near_su=near,
+        frustum_far_su=frustum_far_su,
+        min_cameras_per_block=min_cameras_per_block,
+    )
+
+
 def assign_cameras(
     cams: list[CameraRef],
     blocks: list[Block],
@@ -148,13 +177,17 @@ def assign_cameras(
         if cfg.predicate == "centre":
             member = blk.context.contains(centres_g)  # (N,) bool
         else:
-            member = np.asarray(
+            frustum_member = np.asarray(
                 [
                     _frustum_intersects_box(cams[i], centres_g[i], blk.context, frame, cfg)
                     for i in range(len(cams))
                 ],
                 dtype=bool,
             )
+            # A truncated frustum can exclude its own centre (behind the view
+            # direction or inside the near plane). Context membership is the
+            # required permissive union and protects unique core ownership.
+            member = frustum_member | blk.context.contains(centres_g)
         # Ascending index order, so output is deterministic regardless of the
         # predicate's internal evaluation order.
         assigned.append(sorted(int(i) for i in np.flatnonzero(member)))
@@ -232,32 +265,102 @@ def _frustum_intersects_box(
 ) -> bool:
     """Does this camera's truncated frustum intersect `box`?
 
-    TICKET 1.3'S REMAINING WORK. Implementing this and setting
-    `CameraAssignmentConfig.predicate = "frustum"` completes the ticket.
+    This is an 8-axis, deliberately permissive SAT: the three AABB axes, the
+    view-direction axis, and four side-plane normals. The full SAT also has
+    box-axis/frustum-edge cross products; omitting them can create false
+    positives but cannot create false negatives, which is the intended trade
+    for training-camera assignment.
 
-    Suggested approach — separating-axis test between the frustum's 8 corners
-    and the box, both expressed in G:
-
-      1. Build the 8 frustum corners in CAMERA space from fx, fy, w, h and the
-         near/far planes:
-             x = +/- (w / 2) * z / fx,  y = +/- (h / 2) * z / fy,
-             for z in (near, far).
-         COLMAP camera axes are +x right, +y down, +z forward (view direction).
-      2. Transform to world:  X_world = R_world_cam.T @ X_cam + C_world.
-         (`CameraRef.R_world_cam` is COLMAP's world->camera rotation, so its
-         transpose maps camera->world.)
-      3. Transform to G via `frame.to_ground()`.
-      4. Test the box against the frustum's corner cloud. The cheap, correct-
-         enough version: check the 3 box axes and the 6 frustum face normals as
-         separating axes. Full SAT (15 axes incl. edge cross-products) is
-         available if the cheap version proves too permissive, but a slightly
-         over-inclusive test is HARMLESS here — an extra camera in a block costs
-         training time, a missing one costs reconstruction quality. Bias
-         permissive.
-
-    Whatever is implemented must be deterministic and float64 throughout.
+    The pinhole pyramid assumes a centred principal point. `_FOV_INFLATE`
+    provides a small guard band for the missing principal point, but cannot
+    make this valid for fisheye cameras or fields of view around/above 120
+    degrees. Use the `centre` predicate for such captures.
     """
-    raise NotImplementedError(
-        "Ticket 1.3: frustum-vs-context-box intersection is not implemented. "
-        "Use CameraAssignmentConfig(predicate='centre') until it lands."
+    corners_g = _frustum_corners_ground(cam, frame, cfg)
+    axes = _cheap_sat_axes(corners_g, centre_g)
+    return _sat_intersects_aabb(corners_g, box, axes)
+
+
+def _frustum_corners_ground(
+    cam: CameraRef, frame: GroundFrame, cfg: CameraAssignmentConfig
+) -> np.ndarray:
+    """Return near then far frustum corners in ground coordinates.
+
+    Corner order within each plane is top-left, top-right, bottom-right,
+    bottom-left in COLMAP camera coordinates. The public frustum predicate
+    validates its configuration before reaching this helper.
+    """
+    if not (
+        np.isfinite(cam.fx) and np.isfinite(cam.fy) and cam.fx > 0.0 and cam.fy > 0.0
+    ):
+        raise ValueError(
+            f"camera {cam.name!r} needs finite positive focal lengths for frustum use"
+        )
+    if cam.width <= 0 or cam.height <= 0:
+        raise ValueError(f"camera {cam.name!r} needs positive image dimensions for frustum use")
+
+    half_angle_x = np.arctan((0.5 * float(cam.width)) / cam.fx) * _FOV_INFLATE
+    half_angle_y = np.arctan((0.5 * float(cam.height)) / cam.fy) * _FOV_INFLATE
+    planes = np.asarray((cfg.frustum_near_su, cfg.frustum_far_su), dtype=np.float64)
+    half_widths = planes * np.tan(half_angle_x)
+    half_heights = planes * np.tan(half_angle_y)
+    corners_camera = np.asarray(
+        [
+            (-half_widths[0], -half_heights[0], planes[0]),
+            (half_widths[0], -half_heights[0], planes[0]),
+            (half_widths[0], half_heights[0], planes[0]),
+            (-half_widths[0], half_heights[0], planes[0]),
+            (-half_widths[1], -half_heights[1], planes[1]),
+            (half_widths[1], -half_heights[1], planes[1]),
+            (half_widths[1], half_heights[1], planes[1]),
+            (-half_widths[1], half_heights[1], planes[1]),
+        ],
+        dtype=np.float64,
     )
+    # For row-vector batches, the column-vector transform R.T @ X + C becomes
+    # X @ R + C. CameraRef.R_world_cam is COLMAP's world-to-camera rotation.
+    corners_world = corners_camera @ cam.R_world_cam + cam.C_world
+    return frame.to_ground(corners_world)
+
+
+def _cheap_sat_axes(corners_g: np.ndarray, centre_g: np.ndarray) -> np.ndarray:
+    """Return the three box and five unique frustum-face SAT axes."""
+    centre = np.asarray(centre_g, dtype=np.float64)
+    if centre.shape != (3,):
+        raise ValueError(f"centre_g must have shape (3,), got {centre.shape}")
+    far_centre = corners_g[4:].mean(axis=0)
+    side_pairs = ((0, 3), (1, 2), (0, 1), (3, 2))
+    side_normals = [
+        np.cross(corners_g[first] - centre, corners_g[second] - centre)
+        for first, second in side_pairs
+    ]
+    return np.vstack((np.eye(3, dtype=np.float64), far_centre - centre, side_normals))
+
+
+def _sat_intersects_aabb(corners_g: np.ndarray, box: BlockBox, axes: np.ndarray) -> bool:
+    """Return whether all supplied SAT axes have overlapping projections."""
+    scale = max(
+        1.0,
+        float(np.max(np.abs(corners_g))),
+        float(np.max(np.abs(box.min_g))),
+        float(np.max(np.abs(box.max_g))),
+    )
+    epsilon = _SAT_EPSILON_SCALE * scale
+    box_centre = (box.min_g + box.max_g) * 0.5
+    box_half_extent = (box.max_g - box.min_g) * 0.5
+    for raw_axis in np.asarray(axes, dtype=np.float64):
+        norm = float(np.linalg.norm(raw_axis))
+        if norm <= np.finfo(np.float64).eps:
+            # Degenerate axes cannot separate convex volumes. This occurs at
+            # an apex when the allowed near plane is zero.
+            continue
+        axis = raw_axis / norm
+        frustum_projection = corners_g @ axis
+        box_projection_centre = float(box_centre @ axis)
+        box_radius = float(np.abs(axis) @ box_half_extent)
+        if (
+            float(np.max(frustum_projection)) < box_projection_centre - box_radius - epsilon
+            or float(np.min(frustum_projection)) > box_projection_centre + box_radius + epsilon
+        ):
+            return False
+    return True

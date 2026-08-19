@@ -46,7 +46,16 @@ class MainPanel(lf.ui.Panel):
                 "min_cameras_per_block",
             ):
                 ui.prop(self._operator, field)
-        ui.text_disabled("Camera assignment: centre inside context (frustum pending ticket 1.3).")
+        if ui.collapsing_header("Camera assignment", default_open=True):
+            ui.prop(self._operator, "camera_assignment_predicate")
+            if self._operator.camera_assignment_predicate == "frustum":
+                ui.prop(self._operator, "frustum_far_su")
+                ui.text_wrapped(
+                    "Near plane is derived from the dataset's median frame spacing. "
+                    "Run scripts/tune_frustum_far.py before setting the far plane."
+                )
+            else:
+                ui.text_disabled("Centre assignment is the conservative default.")
         if ui.button_styled("Export blocks", "primary"):
             self._operator.execute(None)
         ui.text_wrapped(self._operator.last_status)
