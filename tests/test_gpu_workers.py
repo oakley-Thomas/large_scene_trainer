@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
+import stat
 
 import pytest
 
@@ -23,18 +25,40 @@ from large_scene_trainer.core.gpu_workers import (
 def _write_jobs(root: Path, job_ids: tuple[str, ...] = ("block_000", "block_001")) -> None:
     images = root / "images"
     images.mkdir(parents=True, exist_ok=True)
+    sparse = root / "sparse" / "0"
+    sparse.mkdir(parents=True, exist_ok=True)
+    hashes = {}
+    for name in ("cameras.bin", "images.bin", "points3D.bin"):
+        path = sparse / name
+        path.write_bytes(name.encode("ascii"))
+        hashes[f"{name.removesuffix('.bin')}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     jobs = []
-    for index, job_id in enumerate(job_ids):
+    index_entries = []
+    for block_id, job_id in enumerate(job_ids):
         block = root / "blocks" / job_id
         block.mkdir(parents=True, exist_ok=True)
         if not (block / "images").exists():
             (block / "images").symlink_to("../../images")
         data_path = f"blocks/{job_id}"
         output_path = f"outputs/{job_id}"
+        manifest = {
+            "schema": 2,
+            "block_id": block_id,
+            "run_id": "test",
+            "ground_frame": {"version": 1, "R": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "origin": [0, 0, 0]},
+            "core": {"min_g": [block_id, 0, 0], "max_g": [block_id + 1, 1, 1]},
+            "context": {"min_g": [block_id, 0, 0], "max_g": [block_id + 1, 1, 1]},
+            "camera_indices": [block_id],
+            "frame_span": [block_id, block_id],
+            "provenance": "test",
+            "source": hashes,
+        }
+        (block / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        index_entries.append({"block_id": block_id, "directory": job_id})
         jobs.append(
             {
                 "job_id": job_id,
-                "block_id": index,
+                "block_id": block_id,
                 "data_path": data_path,
                 "output_path": output_path,
                 "argv": [
@@ -47,6 +71,9 @@ def _write_jobs(root: Path, job_ids: tuple[str, ...] = ("block_000", "block_001"
                 ],
             }
         )
+    (root / "blocks" / "index.json").write_text(
+        json.dumps({"schema": 1, "blocks": index_entries}), encoding="utf-8"
+    )
     (root / "jobs.json").write_text(json.dumps({"schema": 1, "jobs": jobs}), encoding="utf-8")
 
 
@@ -57,6 +84,32 @@ def _native_config(root: Path, run_dir: Path) -> LaunchConfig:
         trainer_mode="native",
         lichtfeld_bin="/bin/true",
     )
+
+
+def _crop_writer(tmp_path: Path) -> Path:
+    """Trainer stand-in that produces the callback's PLY/receipt contract."""
+    script = tmp_path / "crop_writer.py"
+    script.write_text(
+        """#!/usr/bin/env python3
+import hashlib
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ['LST_DATASET_ROOT'])
+run = Path(os.environ['LST_RUN_DIR'])
+block_id = int(os.environ['LST_BLOCK_ID'])
+manifest = root / 'blocks' / f'block_{block_id:03d}' / 'manifest.json'
+output = run / 'merged' / 'crops' / f'block_{block_id:03d}.ply'
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_bytes(b'ply\\nformat binary_little_endian 1.0\\nelement vertex 1\\nproperty float x\\nend_header\\n' + b'\\x00\\x00\\x00\\x00')
+receipt = {'schema': 1, 'block_id': block_id, 'manifest_sha256': hashlib.sha256(manifest.read_bytes()).hexdigest(), 'ply': output.name, 'ply_sha256': hashlib.sha256(output.read_bytes()).hexdigest()}
+output.with_suffix('.json').write_text(json.dumps(receipt), encoding='utf-8')
+""",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script
 
 
 def test_load_jobs_rejects_duplicate_ids_and_path_disagreement(tmp_path):
@@ -113,18 +166,22 @@ def test_native_workers_complete_jobs_and_keep_succeeded_jobs_on_restart(tmp_pat
         run_dir,
         gpu_ids=("0", "1"),
         trainer_mode="native",
-        lichtfeld_bin="/bin/true",
+        lichtfeld_bin=str(_crop_writer(tmp_path)),
     )
     assert first.successful
     assert first.counts == {"pending": 0, "running": 0, "succeeded": 2, "failed": 0}
     assert (run_dir / "logs" / "block_000.log").is_file()
+    assert first.merged_ply == run_dir / "merged" / "scene.ply"
+    assert "lfs_plugins.large_scene_trainer.adapters.splat_io" in (
+        run_dir / "runtime" / "post_train_crop.py"
+    ).read_text(encoding="utf-8")
 
     second = run_workers(
         dataset,
         run_dir,
         gpu_ids=("0",),
         trainer_mode="native",
-        lichtfeld_bin="/bin/true",
+        lichtfeld_bin=str(_crop_writer(tmp_path)),
     )
     assert second.counts == first.counts
 
@@ -147,7 +204,7 @@ def test_failed_jobs_are_only_retried_when_requested(tmp_path):
         run_dir,
         gpu_ids=("0",),
         trainer_mode="native",
-        lichtfeld_bin="/bin/true",
+        lichtfeld_bin=str(_crop_writer(tmp_path)),
     )
     assert unchanged.counts["failed"] == 1
 
@@ -156,7 +213,7 @@ def test_failed_jobs_are_only_retried_when_requested(tmp_path):
         run_dir,
         gpu_ids=("0",),
         trainer_mode="native",
-        lichtfeld_bin="/bin/true",
+        lichtfeld_bin=str(_crop_writer(tmp_path)),
         retry_failed=True,
     )
     assert retried.successful
@@ -185,6 +242,7 @@ def test_container_command_uses_safe_mount_and_in_container_image_assertion(tmp_
         run_dir=(tmp_path / "run").resolve(),
         trainer_mode="container",
         image="example/lf:latest",
+        crop_callback=tmp_path / "run" / "runtime" / "post_train_crop.py",
     )
     command, environment = build_launch_command(
         job, config, "container", resolve_mount_ancestor(dataset, (job,))
@@ -195,8 +253,11 @@ def test_container_command_uses_safe_mount_and_in_container_image_assertion(tmp_
     assert any(entry.endswith(":/input:ro") for entry in command)
     assert "BLOCK_IMAGES=/input/blocks/block_000/images" in command
     assert "CUDA_VISIBLE_DEVICES" in command
+    assert "--centralize=off" in command
+    assert "/run/runtime/post_train_crop.py" in command
     assert "missing block images" in command[command.index("-c") + 1]
-    assert environment == {"CUDA_VISIBLE_DEVICES": ""}
+    assert environment["CUDA_VISIBLE_DEVICES"] == ""
+    assert environment["LST_DATASET_ROOT"] == "/input"
 
 
 def test_parse_gpu_ids_rejects_empty_and_duplicate_values():
