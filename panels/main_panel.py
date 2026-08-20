@@ -74,29 +74,41 @@ class MainPanel(lf.ui.Panel):
             )
             if changed:
                 self._operator.training_run_dir = path
-            rows = self._operator.job_status_rows()
-            if not rows:
-                ui.text_disabled("Generate jobs first, then select an optional training run directory.")
-            elif ui.begin_table("block_training_status", 5):
-                ui.table_setup_column("Block")
-                ui.table_setup_column("Job")
-                ui.table_setup_column("Cameras")
-                ui.table_setup_column("State")
-                ui.table_setup_column("Exit")
-                ui.table_headers_row()
-                for row in rows:
-                    ui.table_next_row()
-                    ui.table_next_column()
-                    ui.label(str(row.block_id))
-                    ui.table_next_column()
-                    ui.label(row.job_id)
-                    ui.table_next_column()
-                    ui.label("—" if row.camera_count is None else str(row.camera_count))
-                    ui.table_next_column()
-                    ui.label(row.state)
-                    ui.table_next_column()
-                    ui.label("—" if row.exit_code is None else str(row.exit_code))
-                ui.end_table()
+            if not self._operator.has_dataset_root:
+                ui.text_disabled("Select a parent COLMAP Dataset root to view training status.")
+            else:
+                rows = self._operator.job_status_rows()
+                if not rows:
+                    ui.text_disabled("Generate jobs first, then select an optional training run directory.")
+                elif ui.begin_table("block_training_status", 5):
+                    ui.table_setup_column("Block")
+                    ui.table_setup_column("Job")
+                    ui.table_setup_column("Cameras")
+                    ui.table_setup_column("State")
+                    ui.table_setup_column("Exit")
+                    ui.table_headers_row()
+                    for row in rows:
+                        ui.table_next_row()
+                        ui.table_next_column()
+                        ui.label(str(row.block_id))
+                        ui.table_next_column()
+                        ui.label(row.job_id)
+                        ui.table_next_column()
+                        ui.label("—" if row.camera_count is None else str(row.camera_count))
+                        ui.table_next_column()
+                        ui.label(row.state)
+                        ui.table_next_column()
+                        ui.label("—" if row.exit_code is None else str(row.exit_code))
+                    ui.end_table()
+                merge = self._operator.merge_status()
+                if merge is not None:
+                    ui.text_disabled(
+                        f"Crop/merge: {merge.state} ({merge.completed_crops}/{merge.total_crops} crops)"
+                    )
+                    if merge.merged_ply is not None:
+                        ui.text_disabled(f"Merged PLY: {merge.merged_ply}")
+            if ui.button("Load cropped blocks for seam inspection"):
+                self._operator.show_cropped_blocks()
         if ui.collapsing_header("Viewport preview", default_open=True):
             ui.text_disabled("Cyan wireframes are cores; orange wireframes are contexts.")
             ui.text_disabled("Reload the parent dataset to clear or refresh the preview.")

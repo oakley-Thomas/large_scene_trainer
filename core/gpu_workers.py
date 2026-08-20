@@ -19,10 +19,32 @@ import threading
 from typing import Any, Iterable, Sequence
 import uuid
 
+from .merge import (
+    BlockArtifact,
+    MergeError,
+    crop_is_complete,
+    crop_receipt_matches,
+    crop_paths,
+    load_block_artifacts,
+    merge_cropped_plys,
+    merge_is_complete,
+    merge_receipt_matches,
+    merged_paths,
+    require_complete_crops,
+    validate_source_hashes,
+    write_merge_receipt,
+)
+
 
 JOBS_SCHEMA_VERSION = 1
 QUEUE_SCHEMA_VERSION = 1
 QUEUE_STATES = ("pending", "running", "succeeded", "failed")
+
+_CROP_BOOTSTRAP = '''import lichtfeld as lf
+lf.plugins.load("large_scene_trainer")
+from lfs_plugins.large_scene_trainer.adapters.splat_io import register_training_crop
+register_training_crop()
+'''
 
 
 class WorkerRunnerError(ValueError):
@@ -43,6 +65,19 @@ def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _write_crop_bootstrap(run_dir: Path) -> Path:
+    """Publish the tiny host-interpreter callback script mounted into containers."""
+    target = run_dir / "runtime" / "post_train_crop.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(_CROP_BOOTSTRAP, encoding="utf-8")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
 
 
 def _read_json(path: Path, description: str) -> dict[str, Any]:
@@ -202,11 +237,26 @@ def resolve_mount_ancestor(dataset_root: Path, jobs: Iterable[WorkerJob]) -> Pat
     return _common_ancestor(paths)
 
 
-def _rewrite_argv(job: WorkerJob, data_path: str, output_path: str) -> list[str]:
+def _rewrite_argv(
+    job: WorkerJob, data_path: str, output_path: str, crop_callback: str | None
+) -> list[str]:
     argv = list(job.argv)
     for flag, replacement in (("--data-path", data_path), ("--output-path", output_path)):
         position = argv.index(flag)
         argv[position + 1] = replacement
+    for index, value in enumerate(argv):
+        if value == "--centralize":
+            if index + 1 == len(argv):
+                raise WorkerRunnerError(f"job {job.job_id!r} has a dangling --centralize flag")
+            argv[index + 1] = "off"
+            break
+        if value.startswith("--centralize="):
+            argv[index] = "--centralize=off"
+            break
+    else:
+        argv.append("--centralize=off")
+    if crop_callback is not None:
+        argv.extend(("--python-script", crop_callback))
     return argv
 
 
@@ -219,6 +269,7 @@ class LaunchConfig:
     lichtfeld_bin: str | None = None
     container_engine: str = "docker"
     container_bin: str = "LichtFeld-Studio"
+    crop_callback: Path | None = None
 
     def __post_init__(self) -> None:
         if self.trainer_mode not in {"auto", "container", "native"}:
@@ -265,8 +316,18 @@ def build_launch_command(
     if mode == "native":
         if not config.lichtfeld_bin:
             raise WorkerRunnerError("native mode requires --lichtfeld-bin")
-        argv = _rewrite_argv(job, str(block), str(output_dir))
-        return [config.lichtfeld_bin, *argv], {"CUDA_VISIBLE_DEVICES": ""}
+        argv = _rewrite_argv(
+            job,
+            str(block),
+            str(output_dir),
+            None if config.crop_callback is None else str(config.crop_callback),
+        )
+        return [config.lichtfeld_bin, *argv], {
+            "CUDA_VISIBLE_DEVICES": "",
+            "LST_DATASET_ROOT": str(config.dataset_root),
+            "LST_RUN_DIR": str(config.run_dir),
+            "LST_BLOCK_ID": str(job.block_id),
+        }
 
     if mode != "container" or not config.image:
         raise WorkerRunnerError("container mode requires --image")
@@ -275,7 +336,18 @@ def build_launch_command(
     except ValueError as exc:
         raise WorkerRunnerError(f"block is outside its resolved mount ancestor: {block}") from exc
     container_output = Path("/run") / "outputs" / job.job_id
-    argv = _rewrite_argv(job, container_block.as_posix(), container_output.as_posix())
+    try:
+        container_root = Path("/input") / config.dataset_root.relative_to(mount_ancestor)
+    except ValueError as exc:
+        raise WorkerRunnerError(
+            f"dataset root is outside its resolved mount ancestor: {config.dataset_root}"
+        ) from exc
+    argv = _rewrite_argv(
+        job,
+        container_block.as_posix(),
+        container_output.as_posix(),
+        "/run/runtime/post_train_crop.py" if config.crop_callback is not None else None,
+    )
     # The container must include a POSIX shell and expose LichtFeld on PATH (or
     # receive its path through --container-bin).  Shell entrypoint injection
     # validates the symlink *after* Docker's mounts are active.
@@ -283,6 +355,12 @@ def build_launch_command(
         'test -e "$BLOCK_IMAGES" || { echo "missing block images: $BLOCK_IMAGES" >&2; exit 64; }; '
         'exec "$CONTAINER_TRAINER" "$@"'
     )
+    environment = {
+        "CUDA_VISIBLE_DEVICES": "",
+        "LST_DATASET_ROOT": container_root.as_posix(),
+        "LST_RUN_DIR": "/run",
+        "LST_BLOCK_ID": str(job.block_id),
+    }
     command = [
         config.container_engine,
         "run",
@@ -297,8 +375,6 @@ def build_launch_command(
         f"BLOCK_IMAGES={container_block.as_posix()}/images",
         "-e",
         f"CONTAINER_TRAINER={config.container_bin}",
-        "-e",
-        "CUDA_VISIBLE_DEVICES",
         "--entrypoint",
         "/bin/sh",
         config.image,
@@ -307,7 +383,15 @@ def build_launch_command(
         "sh",
         *argv,
     ]
-    return command, {"CUDA_VISIBLE_DEVICES": ""}
+    entrypoint = command.index("--entrypoint")
+    environment_flags: list[str] = []
+    for name, value in environment.items():
+        # Pass the worker-selected GPU through to Docker; assigning the empty
+        # template value here would hide every GPU inside the container.
+        rendered = name if name == "CUDA_VISIBLE_DEVICES" else f"{name}={value}"
+        environment_flags.extend(("-e", rendered))
+    command[entrypoint:entrypoint] = environment_flags
+    return command, environment
 
 
 class QueueStore:
@@ -480,6 +564,8 @@ class QueueStore:
 class RunSummary:
     counts: dict[str, int]
     mode: str
+    merge_state: str = "pending"
+    merged_ply: Path | None = None
 
     @property
     def successful(self) -> bool:
@@ -487,6 +573,7 @@ class RunSummary:
             self.counts["failed"] == 0
             and self.counts["pending"] == 0
             and self.counts["running"] == 0
+            and self.merge_state == "succeeded"
         )
 
 
@@ -499,6 +586,16 @@ class JobStatus:
     camera_count: int | None
     state: str
     exit_code: int | None
+
+
+@dataclass(frozen=True)
+class MergeStatus:
+    """Panel-ready state for the post-training crop/merge artifacts."""
+
+    state: str
+    completed_crops: int
+    total_crops: int
+    merged_ply: Path | None
 
 
 def load_job_status(dataset_root: str | Path, run_dir: str | Path | None) -> tuple[JobStatus, ...]:
@@ -529,7 +626,9 @@ def load_job_status(dataset_root: str | Path, run_dir: str | Path | None) -> tup
                 block_id=job.block_id,
                 camera_count=camera_count if isinstance(camera_count, int) else None,
                 state=str(state.get("state", "not started")),
-                exit_code=state.get("exit_code") if isinstance(state.get("exit_code"), int) else None,
+                exit_code=(
+                    state.get("exit_code") if isinstance(state.get("exit_code"), int) else None
+                ),
             )
         )
     unexpected = sorted(set(states) - {job.job_id for job in jobs})
@@ -538,8 +637,34 @@ def load_job_status(dataset_root: str | Path, run_dir: str | Path | None) -> tup
     return tuple(rows)
 
 
+def load_merge_status(dataset_root: str | Path, run_dir: str | Path | None) -> MergeStatus:
+    """Read lightweight crop/merge status without hashing multi-GB PLYs on the UI thread."""
+    if not run_dir:
+        return MergeStatus("not started", 0, 0, None)
+    root = Path(dataset_root).expanduser().resolve()
+    try:
+        _, artifacts = load_block_artifacts(root)
+    except MergeError as exc:
+        raise WorkerRunnerError(f"crop/merge input validation failed: {exc}") from exc
+    completed = sum(
+        crop_receipt_matches(crop_paths(run_dir, artifact.block.block_id), artifact)
+        for artifact in artifacts
+    )
+    output, _ = merged_paths(run_dir)
+    if merge_receipt_matches(run_dir, artifacts):
+        return MergeStatus("merged", completed, len(artifacts), output)
+    if completed:
+        return MergeStatus("awaiting merge", completed, len(artifacts), None)
+    return MergeStatus("awaiting crops", 0, len(artifacts), None)
+
+
 def _worker_loop(
-    queue: QueueStore, config: LaunchConfig, mode: str, mount_ancestor: Path, gpu_id: str
+    queue: QueueStore,
+    config: LaunchConfig,
+    mode: str,
+    mount_ancestor: Path,
+    artifacts: dict[int, BlockArtifact],
+    gpu_id: str,
 ) -> None:
     worker_id = f"{os.getpid()}-gpu-{gpu_id}"
     while True:
@@ -582,6 +707,13 @@ def _worker_loop(
                     )
                     queue.set_process_id(running_path, process.pid)
                     exit_code = process.wait()
+            if exit_code == 0:
+                artifact = artifacts[job.block_id]
+                if not crop_is_complete(crop_paths(config.run_dir, job.block_id), artifact):
+                    raise WorkerRunnerError(
+                        f"job {job.job_id!r} exited successfully but did not produce "
+                        "a valid cropped PLY and receipt"
+                    )
             queue.complete(running_path, command=command, log_path=log_path, exit_code=exit_code)
         except (OSError, WorkerRunnerError) as exc:
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -614,14 +746,24 @@ def run_workers(
         raise WorkerRunnerError("at least one unique GPU ID is required")
     root = Path(dataset_root).expanduser().resolve()
     jobs = load_jobs(root)
+    try:
+        _, artifacts_tuple = load_block_artifacts(root)
+        validate_source_hashes(root, artifacts_tuple)
+    except MergeError as exc:
+        raise WorkerRunnerError(f"crop/merge input validation failed: {exc}") from exc
+    artifacts = {artifact.block.block_id: artifact for artifact in artifacts_tuple}
+    if set(artifacts) != {job.block_id for job in jobs}:
+        raise WorkerRunnerError("jobs.json does not match the exported block manifests")
+    resolved_run_dir = Path(run_dir).expanduser().resolve()
     config = LaunchConfig(
         dataset_root=root,
-        run_dir=Path(run_dir).expanduser().resolve(),
+        run_dir=resolved_run_dir,
         trainer_mode=trainer_mode,
         image=image,
         lichtfeld_bin=lichtfeld_bin,
         container_engine=container_engine,
         container_bin=container_bin,
+        crop_callback=_write_crop_bootstrap(resolved_run_dir),
     )
     mode = choose_trainer_mode(config)
     mount_ancestor = resolve_mount_ancestor(root, jobs)
@@ -630,11 +772,11 @@ def run_workers(
     if dry_run:
         for job in jobs:
             build_launch_command(job, config, mode, mount_ancestor)
-        return RunSummary(queue.counts(), mode)
+        return RunSummary(queue.counts(), mode, "dry-run")
     threads = [
         threading.Thread(
             target=_worker_loop,
-            args=(queue, config, mode, mount_ancestor, gpu_id),
+            args=(queue, config, mode, mount_ancestor, artifacts, gpu_id),
             name=f"gpu-worker-{gpu_id}",
         )
         for gpu_id in gpu_ids
@@ -643,4 +785,16 @@ def run_workers(
         thread.start()
     for thread in threads:
         thread.join()
-    return RunSummary(queue.counts(), mode)
+    counts = queue.counts()
+    if counts["failed"] or counts["pending"] or counts["running"]:
+        return RunSummary(counts, mode, "pending")
+    if merge_is_complete(config.run_dir, artifacts_tuple):
+        return RunSummary(counts, mode, "succeeded", merged_paths(config.run_dir)[0])
+    try:
+        inputs = require_complete_crops(config.run_dir, artifacts_tuple)
+        output, _ = merged_paths(config.run_dir)
+        merge_cropped_plys(inputs, output)
+        write_merge_receipt(config.run_dir, artifacts_tuple)
+    except MergeError:
+        return RunSummary(counts, mode, "failed")
+    return RunSummary(counts, mode, "succeeded", merged_paths(config.run_dir)[0])

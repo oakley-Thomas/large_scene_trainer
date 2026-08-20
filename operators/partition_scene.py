@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic
 
 import lichtfeld as lf
 from lfs_plugins.props import EnumProperty, FloatProperty, IntProperty, StringProperty
@@ -12,6 +13,7 @@ from ..adapters.viewport_preview import (
     ViewportPreviewError,
     show_block_preview,
 )
+from ..adapters.splat_io import SplatIOError, load_cropped_blocks
 from ..core.assignment_report import BlockAssignmentRow, block_assignment_rows
 from ..core.camera_assign import CameraAssignmentConfig, frustum_config_from_diagnostics
 from ..core.colmap_io import load_cameras
@@ -22,7 +24,13 @@ from ..core.job_generation import (
     TRAINING_STRATEGIES,
     generate_jobs,
 )
-from ..core.gpu_workers import WorkerRunnerError, load_job_status
+from ..core.gpu_workers import WorkerRunnerError, load_job_status, load_merge_status
+from ..core.merge import (
+    MergeError,
+    load_block_artifacts,
+    require_complete_crops,
+    validate_source_hashes,
+)
 from ..core.partition import config_from_diagnostics
 from ..core.preview_layout import PreviewLayoutError, load_exported_layout
 from ..core.trajectory_diagnostics import (
@@ -95,11 +103,17 @@ class PartitionScene(Operator):
         description="Optional run directory created by scripts/run_gpu_workers.py",
     )
 
+    _STATUS_REFRESH_SECONDS = 1.0
+
     def __init__(self) -> None:
         super().__init__()
         self._validated_root: Path | None = None
         self._preview_blocks = ()
         self._preview_frame = None
+        self._status_cache_key: tuple[str, str] | None = None
+        self._status_cache_at = 0.0
+        self._cached_job_status = ()
+        self._cached_merge_status = None
         self.last_status = "Choose a parent dataset and validate it."
 
     @classmethod
@@ -111,6 +125,32 @@ class PartitionScene(Operator):
         if not self.dataset_root.strip():
             raise ExportError("choose a parent COLMAP dataset root first")
         return Path(self.dataset_root).expanduser().resolve()
+
+    @property
+    def has_dataset_root(self) -> bool:
+        """Whether status polling has enough input to touch the filesystem."""
+        return bool(self.dataset_root.strip())
+
+    def _refresh_status_cache(self) -> None:
+        """Rate-limit panel status reads; ``draw`` can run hundreds of times per second."""
+        key = (self.dataset_root.strip(), self.training_run_dir.strip())
+        now = monotonic()
+        if key == self._status_cache_key and now - self._status_cache_at < self._STATUS_REFRESH_SECONDS:
+            return
+        self._status_cache_key = key
+        self._status_cache_at = now
+        self._cached_job_status = ()
+        self._cached_merge_status = None
+        if not key[0]:
+            return
+        try:
+            root = self._root()
+            self._cached_job_status = load_job_status(root, key[1] or None)
+            self._cached_merge_status = load_merge_status(root, key[1] or None)
+        except (OSError, ValueError, WorkerRunnerError) as exc:
+            # Status reads are passive UI polling. Keep the error visible in
+            # the panel but never emit it for every redraw.
+            self.last_status = f"Training-status read failed: {exc}"
 
     def _segmentation_config(self) -> SegmentationConfig:
         return SegmentationConfig(
@@ -261,10 +301,27 @@ class PartitionScene(Operator):
 
     def job_status_rows(self):
         """Return jobs plus their current queue state for the panel."""
+        self._refresh_status_cache()
+        return self._cached_job_status
+
+    def merge_status(self):
+        """Return crop/merge progress for the currently selected training run."""
+        self._refresh_status_cache()
+        return self._cached_merge_status
+
+    def show_cropped_blocks(self) -> bool:
+        """Load completed crop artifacts as separate nodes for seam inspection."""
         try:
-            run_dir = self.training_run_dir.strip() or None
-            return load_job_status(self._root(), run_dir)
-        except (OSError, ValueError, WorkerRunnerError) as exc:
-            self.last_status = f"Job-status read failed: {exc}"
+            if not self.training_run_dir.strip():
+                raise MergeError("choose a training run directory first")
+            _, artifacts = load_block_artifacts(self._root())
+            validate_source_hashes(self._root(), artifacts)
+            crops = require_complete_crops(self.training_run_dir, artifacts)
+            summary = load_cropped_blocks(crops)
+            self.last_status = f"Loaded {len(summary)} cropped block nodes for seam inspection."
+            lf.log.info(f"PartitionScene: {self.last_status}")
+            return True
+        except (OSError, ValueError, MergeError, SplatIOError) as exc:
+            self.last_status = f"Load cropped blocks failed: {exc}"
             lf.log.error(f"PartitionScene: {self.last_status}")
-            return ()
+            return False
