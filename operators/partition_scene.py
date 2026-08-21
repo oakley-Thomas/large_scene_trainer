@@ -24,7 +24,12 @@ from ..core.job_generation import (
     TRAINING_STRATEGIES,
     generate_jobs,
 )
-from ..core.gpu_workers import WorkerRunnerError, load_job_status, load_merge_status
+from ..core.gpu_workers import (
+    WorkerRunnerError,
+    export_merged_rad,
+    load_job_status,
+    load_merge_status,
+)
 from ..core.merge import (
     MergeError,
     load_block_artifacts,
@@ -101,6 +106,11 @@ class PartitionScene(Operator):
         subtype="DIR_PATH",
         name="Training run directory",
         description="Optional run directory created by scripts/run_gpu_workers.py",
+    )
+    rad_converter_bin = StringProperty(
+        default="LichtFeld-Studio",
+        name="RAD converter executable",
+        description="LichtFeld executable used when exporting the merged RAD artifact",
     )
 
     _STATUS_REFRESH_SECONDS = 1.0
@@ -308,6 +318,23 @@ class PartitionScene(Operator):
         """Return crop/merge progress for the currently selected training run."""
         self._refresh_status_cache()
         return self._cached_merge_status
+
+    def export_merged_rad(self) -> bool:
+        """Explicitly convert the current run's validated merged PLY to RAD."""
+        try:
+            if not self.training_run_dir.strip():
+                raise WorkerRunnerError("choose a training run directory first")
+            output = export_merged_rad(
+                self._root(), self.training_run_dir, self.rad_converter_bin.strip()
+            )
+            self._status_cache_at = 0.0
+            self.last_status = f"Exported merged RAD: {output}"
+            lf.log.info(f"PartitionScene: {self.last_status}")
+            return True
+        except (OSError, ValueError, WorkerRunnerError) as exc:
+            self.last_status = f"RAD export failed: {exc}"
+            lf.log.error(f"PartitionScene: {self.last_status}")
+            return False
 
     def show_cropped_blocks(self) -> bool:
         """Load completed crop artifacts as separate nodes for seam inspection."""

@@ -103,10 +103,18 @@ class MainPanel(lf.ui.Panel):
                 merge = self._operator.merge_status()
                 if merge is not None:
                     ui.text_disabled(
-                        f"Crop/merge: {merge.state} ({merge.completed_crops}/{merge.total_crops} crops)"
+                        "Crop/merge: "
+                        f"{merge.state} ({merge.completed_crops}/{merge.total_crops} crops); "
+                        f"RAD: {merge.rad_state}"
                     )
                     if merge.merged_ply is not None:
                         ui.text_disabled(f"Merged PLY: {merge.merged_ply}")
+                    if merge.rad_path is not None:
+                        ui.text_disabled(f"RAD: {merge.rad_path}")
+                    if merge.state == "merged":
+                        ui.prop(self._operator, "rad_converter_bin")
+                        if ui.button_styled("Export merged RAD", "primary"):
+                            self._operator.export_merged_rad()
             if ui.button("Load cropped blocks for seam inspection"):
                 self._operator.show_cropped_blocks()
         if ui.collapsing_header("Viewport preview", default_open=True):

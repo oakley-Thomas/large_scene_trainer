@@ -72,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"mode={summary.mode} "
         + " ".join(f"{name}={count}" for name, count in sorted(summary.counts.items()))
+        + f" merge={summary.merge_state}"
     )
     return 0 if summary.successful else 1
 

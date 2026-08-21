@@ -14,8 +14,11 @@ from large_scene_trainer.core.gpu_workers import (
     QueueStore,
     WorkerRunnerError,
     build_launch_command,
+    build_rad_conversion_command,
+    export_merged_rad,
     load_job_status,
     load_jobs,
+    load_merge_status,
     parse_gpu_ids,
     resolve_mount_ancestor,
     run_workers,
@@ -77,16 +80,7 @@ def _write_jobs(root: Path, job_ids: tuple[str, ...] = ("block_000", "block_001"
     (root / "jobs.json").write_text(json.dumps({"schema": 1, "jobs": jobs}), encoding="utf-8")
 
 
-def _native_config(root: Path, run_dir: Path) -> LaunchConfig:
-    return LaunchConfig(
-        dataset_root=root.resolve(),
-        run_dir=run_dir.resolve(),
-        trainer_mode="native",
-        lichtfeld_bin="/bin/true",
-    )
-
-
-def _crop_writer(tmp_path: Path) -> Path:
+def _crop_writer(tmp_path: Path, *, fail_conversion: bool = False) -> Path:
     """Trainer stand-in that produces the callback's PLY/receipt contract."""
     script = tmp_path / "crop_writer.py"
     script.write_text(
@@ -95,6 +89,21 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
+
+"""
+        + f"FAIL_CONVERSION = {fail_conversion!r}\n"
+        + """
+
+if len(sys.argv) > 1 and sys.argv[1] == 'convert':
+    if FAIL_CONVERSION:
+        raise SystemExit(23)
+    source = Path(sys.argv[2])
+    destination = Path(sys.argv[3])
+    destination.write_bytes(source.read_bytes() + b'RAD')
+    count = destination.with_suffix('.convert_calls')
+    count.write_text(str(int(count.read_text()) + 1) if count.exists() else '1')
+    raise SystemExit(0)
 
 root = Path(os.environ['LST_DATASET_ROOT'])
 run = Path(os.environ['LST_RUN_DIR'])
@@ -156,7 +165,7 @@ def test_queue_claim_recovery_and_explicit_failed_retry(tmp_path):
     assert job.job_id == "block_000"
 
 
-def test_native_workers_complete_jobs_and_keep_succeeded_jobs_on_restart(tmp_path):
+def test_native_workers_merge_then_explicitly_export_rad_without_retraining(tmp_path):
     dataset = tmp_path / "dataset"
     _write_jobs(dataset)
     run_dir = tmp_path / "run"
@@ -172,6 +181,7 @@ def test_native_workers_complete_jobs_and_keep_succeeded_jobs_on_restart(tmp_pat
     assert first.counts == {"pending": 0, "running": 0, "succeeded": 2, "failed": 0}
     assert (run_dir / "logs" / "block_000.log").is_file()
     assert first.merged_ply == run_dir / "merged" / "scene.ply"
+    assert not (run_dir / "merged" / "scene.rad").exists()
     assert "lfs_plugins.large_scene_trainer.adapters.splat_io" in (
         run_dir / "runtime" / "post_train_crop.py"
     ).read_text(encoding="utf-8")
@@ -184,6 +194,34 @@ def test_native_workers_complete_jobs_and_keep_succeeded_jobs_on_restart(tmp_pat
         lichtfeld_bin=str(_crop_writer(tmp_path)),
     )
     assert second.counts == first.counts
+    assert second.successful
+    output = export_merged_rad(dataset, run_dir, str(_crop_writer(tmp_path)))
+    assert output == run_dir / "merged" / "scene.rad"
+    assert (run_dir / "merged" / "scene.convert_calls").read_text() == "1"
+    assert export_merged_rad(dataset, run_dir, str(_crop_writer(tmp_path))) == output
+    assert (run_dir / "merged" / "scene.convert_calls").read_text() == "1"
+
+
+def test_explicit_rad_conversion_failure_preserves_merged_ply_and_retries(tmp_path):
+    dataset = tmp_path / "dataset"
+    _write_jobs(dataset, ("block_000",))
+    run_dir = tmp_path / "run"
+
+    summary = run_workers(
+        dataset,
+        run_dir,
+        gpu_ids=("0",),
+        trainer_mode="native",
+        lichtfeld_bin=str(_crop_writer(tmp_path, fail_conversion=True)),
+    )
+    assert summary.successful
+    assert (run_dir / "merged" / "scene.ply").is_file()
+    with pytest.raises(WorkerRunnerError, match="RAD conversion failed"):
+        export_merged_rad(dataset, run_dir, str(_crop_writer(tmp_path, fail_conversion=True)))
+    assert load_merge_status(dataset, run_dir).rad_state == "failed"
+
+    output = export_merged_rad(dataset, run_dir, str(_crop_writer(tmp_path)))
+    assert output == run_dir / "merged" / "scene.rad"
 
 
 def test_failed_jobs_are_only_retried_when_requested(tmp_path):
@@ -258,6 +296,19 @@ def test_container_command_uses_safe_mount_and_in_container_image_assertion(tmp_
     assert "missing block images" in command[command.index("-c") + 1]
     assert environment["CUDA_VISIBLE_DEVICES"] == ""
     assert environment["LST_DATASET_ROOT"] == "/input"
+
+
+def test_rad_conversion_commands_target_the_merged_artifacts(tmp_path):
+    run_dir = tmp_path / "run"
+    assert build_rad_conversion_command(run_dir, "/bin/true") == [
+        "/bin/true",
+        "convert",
+        str((run_dir / "merged" / "scene.ply").resolve()),
+        str((run_dir / "merged" / "scene.rad").resolve()),
+        "--format",
+        "rad",
+        "--overwrite",
+    ]
 
 
 def test_parse_gpu_ids_rejects_empty_and_duplicate_values():

@@ -30,9 +30,14 @@ from .merge import (
     merge_is_complete,
     merge_receipt_matches,
     merged_paths,
+    rad_is_complete,
+    rad_paths,
+    rad_receipt_state,
     require_complete_crops,
     validate_source_hashes,
     write_merge_receipt,
+    write_rad_failure,
+    write_rad_receipt,
 )
 
 
@@ -394,6 +399,57 @@ def build_launch_command(
     return command, environment
 
 
+def build_rad_conversion_command(run_dir: str | Path, lichtfeld_bin: str) -> list[str]:
+    """Build the explicit merged-PLY to RAD conversion command."""
+    if not lichtfeld_bin:
+        raise WorkerRunnerError("RAD conversion requires a LichtFeld executable")
+    source, _ = merged_paths(run_dir)
+    destination, _ = rad_paths(run_dir)
+    args = ["convert", str(source), str(destination), "--format", "rad", "--overwrite"]
+    return [lichtfeld_bin, *args]
+
+
+def export_merged_rad(
+    dataset_root: str | Path, run_dir: str | Path, lichtfeld_bin: str
+) -> Path:
+    """Explicitly convert a validated merged PLY and persist the result status."""
+    root = Path(dataset_root).expanduser().resolve()
+    resolved_run_dir = Path(run_dir).expanduser().resolve()
+    try:
+        _, artifacts = load_block_artifacts(root)
+        validate_source_hashes(root, artifacts)
+    except MergeError as exc:
+        raise WorkerRunnerError(f"crop/merge input validation failed: {exc}") from exc
+    if not merge_is_complete(resolved_run_dir, artifacts):
+        raise WorkerRunnerError("merged PLY is missing or has an invalid receipt")
+    rad, _ = rad_paths(resolved_run_dir)
+    if rad_is_complete(resolved_run_dir):
+        return rad
+
+    command = build_rad_conversion_command(resolved_run_dir, lichtfeld_bin)
+    log_path = resolved_run_dir / "logs" / "rad_conversion.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    exit_code: int | None = None
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False)
+        exit_code = result.returncode
+        if exit_code != 0:
+            raise WorkerRunnerError(
+                f"RAD conversion exited {exit_code}; inspect conversion log: {log_path}"
+            )
+        write_rad_receipt(resolved_run_dir, command)
+        if not rad_is_complete(resolved_run_dir):
+            raise WorkerRunnerError("RAD conversion receipt did not validate after export")
+    except (OSError, MergeError, WorkerRunnerError) as exc:
+        try:
+            write_rad_failure(resolved_run_dir, command, exit_code, str(exc))
+        except MergeError:
+            pass
+        raise WorkerRunnerError(f"RAD conversion failed: {exc}") from exc
+    return rad
+
+
 class QueueStore:
     """Filesystem-backed per-job state machine for one training run directory."""
 
@@ -596,6 +652,8 @@ class MergeStatus:
     completed_crops: int
     total_crops: int
     merged_ply: Path | None
+    rad_state: str
+    rad_path: Path | None
 
 
 def load_job_status(dataset_root: str | Path, run_dir: str | Path | None) -> tuple[JobStatus, ...]:
@@ -640,7 +698,7 @@ def load_job_status(dataset_root: str | Path, run_dir: str | Path | None) -> tup
 def load_merge_status(dataset_root: str | Path, run_dir: str | Path | None) -> MergeStatus:
     """Read lightweight crop/merge status without hashing multi-GB PLYs on the UI thread."""
     if not run_dir:
-        return MergeStatus("not started", 0, 0, None)
+        return MergeStatus("not started", 0, 0, None, "not started", None)
     root = Path(dataset_root).expanduser().resolve()
     try:
         _, artifacts = load_block_artifacts(root)
@@ -652,10 +710,19 @@ def load_merge_status(dataset_root: str | Path, run_dir: str | Path | None) -> M
     )
     output, _ = merged_paths(run_dir)
     if merge_receipt_matches(run_dir, artifacts):
-        return MergeStatus("merged", completed, len(artifacts), output)
+        rad_state = rad_receipt_state(run_dir)
+        rad, _ = rad_paths(run_dir)
+        return MergeStatus(
+            "merged",
+            completed,
+            len(artifacts),
+            output,
+            rad_state,
+            rad if rad_state == "ready" else None,
+        )
     if completed:
-        return MergeStatus("awaiting merge", completed, len(artifacts), None)
-    return MergeStatus("awaiting crops", 0, len(artifacts), None)
+        return MergeStatus("awaiting merge", completed, len(artifacts), None, "pending", None)
+    return MergeStatus("awaiting crops", 0, len(artifacts), None, "pending", None)
 
 
 def _worker_loop(
@@ -788,13 +855,14 @@ def run_workers(
     counts = queue.counts()
     if counts["failed"] or counts["pending"] or counts["running"]:
         return RunSummary(counts, mode, "pending")
-    if merge_is_complete(config.run_dir, artifacts_tuple):
-        return RunSummary(counts, mode, "succeeded", merged_paths(config.run_dir)[0])
-    try:
-        inputs = require_complete_crops(config.run_dir, artifacts_tuple)
-        output, _ = merged_paths(config.run_dir)
-        merge_cropped_plys(inputs, output)
-        write_merge_receipt(config.run_dir, artifacts_tuple)
-    except MergeError:
+    if not merge_is_complete(config.run_dir, artifacts_tuple):
+        try:
+            inputs = require_complete_crops(config.run_dir, artifacts_tuple)
+            output, _ = merged_paths(config.run_dir)
+            merge_cropped_plys(inputs, output)
+            write_merge_receipt(config.run_dir, artifacts_tuple)
+        except MergeError:
+            return RunSummary(counts, mode, "failed")
+    if not merge_is_complete(config.run_dir, artifacts_tuple):
         return RunSummary(counts, mode, "failed")
     return RunSummary(counts, mode, "succeeded", merged_paths(config.run_dir)[0])

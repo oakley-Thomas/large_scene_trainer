@@ -22,6 +22,7 @@ from .types import Block, GroundFrame
 
 CROP_RECEIPT_SCHEMA = 1
 MERGE_RECEIPT_SCHEMA = 1
+RAD_RECEIPT_SCHEMA = 1
 
 
 class MergeError(ValueError):
@@ -259,6 +260,12 @@ def merged_paths(run_dir: str | Path) -> tuple[Path, Path]:
     return directory / "scene.ply", directory / "scene.json"
 
 
+def rad_paths(run_dir: str | Path) -> tuple[Path, Path]:
+    """Return the converted RAD artifact and its durable conversion status."""
+    directory = Path(run_dir).expanduser().resolve() / "merged"
+    return directory / "scene.rad", directory / "scene.rad.json"
+
+
 def write_merge_receipt(run_dir: str | Path, artifacts: Iterable[BlockArtifact]) -> None:
     output, receipt = merged_paths(run_dir)
     if not output.is_file():
@@ -317,6 +324,97 @@ def merge_receipt_matches(run_dir: str | Path, artifacts: Iterable[BlockArtifact
         )
     except (OSError, MergeError):
         return False
+
+
+def write_rad_receipt(run_dir: str | Path, command: Sequence[str]) -> None:
+    """Publish a successful RAD conversion only after both artifacts exist."""
+    ply, _ = merged_paths(run_dir)
+    rad, receipt = rad_paths(run_dir)
+    if not ply.is_file():
+        raise MergeError(f"merged PLY was not exported: {ply}")
+    if not rad.is_file():
+        raise MergeError(f"RAD conversion did not produce an artifact: {rad}")
+    _write_json_atomically(
+        receipt,
+        {
+            "schema": RAD_RECEIPT_SCHEMA,
+            "state": "succeeded",
+            "ply": ply.name,
+            "ply_sha256": _sha256(ply),
+            "rad": rad.name,
+            "rad_sha256": _sha256(rad),
+            "command": list(command),
+        },
+    )
+
+
+def write_rad_failure(
+    run_dir: str | Path,
+    command: Sequence[str],
+    exit_code: int | None,
+    error: str,
+) -> None:
+    """Persist a failed conversion so passive status reads retain the reason."""
+    ply, _ = merged_paths(run_dir)
+    rad, receipt = rad_paths(run_dir)
+    if not ply.is_file():
+        raise MergeError(f"merged PLY was not exported: {ply}")
+    _write_json_atomically(
+        receipt,
+        {
+            "schema": RAD_RECEIPT_SCHEMA,
+            "state": "failed",
+            "ply": ply.name,
+            "ply_sha256": _sha256(ply),
+            "rad": rad.name,
+            "command": list(command),
+            "exit_code": exit_code,
+            "error": error,
+        },
+    )
+
+
+def rad_is_complete(run_dir: str | Path) -> bool:
+    """Verify both RAD and PLY content before reusing a prior conversion."""
+    ply, _ = merged_paths(run_dir)
+    rad, receipt_path = rad_paths(run_dir)
+    if not ply.is_file() or not rad.is_file() or not receipt_path.is_file():
+        return False
+    try:
+        receipt = _read_json(receipt_path, "RAD receipt")
+        return (
+            receipt.get("schema") == RAD_RECEIPT_SCHEMA
+            and receipt.get("state") == "succeeded"
+            and receipt.get("ply") == ply.name
+            and receipt.get("ply_sha256") == _sha256(ply)
+            and receipt.get("rad") == rad.name
+            and receipt.get("rad_sha256") == _sha256(rad)
+        )
+    except (OSError, MergeError):
+        return False
+
+
+def rad_receipt_state(run_dir: str | Path) -> str:
+    """Return cheap panel status without hashing the multi-GB artifacts."""
+    ply, _ = merged_paths(run_dir)
+    rad, receipt_path = rad_paths(run_dir)
+    if not receipt_path.is_file():
+        return "pending"
+    try:
+        receipt = _read_json(receipt_path, "RAD receipt")
+        if (
+            receipt.get("schema") != RAD_RECEIPT_SCHEMA
+            or receipt.get("ply") != ply.name
+            or receipt.get("rad") != rad.name
+        ):
+            return "pending"
+        if receipt.get("state") == "succeeded" and rad.is_file():
+            return "ready"
+        if receipt.get("state") == "failed":
+            return "failed"
+    except (OSError, MergeError):
+        pass
+    return "pending"
 
 
 _PLY_SCALAR_BYTES = {

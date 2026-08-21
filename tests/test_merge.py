@@ -19,11 +19,16 @@ from large_scene_trainer.core.merge import (
     merge_is_complete,
     merge_receipt_matches,
     merged_paths,
+    rad_is_complete,
+    rad_paths,
+    rad_receipt_state,
     ownership_ids,
     ownership_mask,
     validate_source_hashes,
     write_crop_receipt,
     write_merge_receipt,
+    write_rad_failure,
+    write_rad_receipt,
 )
 from large_scene_trainer.core.types import Block, BlockBox
 
@@ -116,3 +121,34 @@ def test_crop_and_merge_receipts_are_content_addressed_and_idempotent(tmp_path):
     assert not merge_is_complete(run_dir, artifacts)
     # The fast status path intentionally avoids reading large PLY payloads.
     assert merge_receipt_matches(run_dir, artifacts)
+
+
+def test_rad_receipts_detect_tampering_and_keep_conversion_failure_for_retry(tmp_path):
+    _, artifacts = _dataset(tmp_path / "dataset")
+    run_dir = tmp_path / "run"
+    for artifact in artifacts:
+        paths = crop_paths(run_dir, artifact.block.block_id)
+        _write_ply(paths.ply, (float(artifact.block.block_id),))
+        write_crop_receipt(paths, artifact)
+    output, _ = merged_paths(run_dir)
+    merge_cropped_plys([crop_paths(run_dir, item.block.block_id).ply for item in artifacts], output)
+    write_merge_receipt(run_dir, artifacts)
+
+    rad, _ = rad_paths(run_dir)
+    rad.write_bytes(b"converted")
+    write_rad_receipt(run_dir, ["LichtFeld-Studio", "convert"])
+    assert rad_is_complete(run_dir)
+    assert rad_receipt_state(run_dir) == "ready"
+
+    merged_bytes = output.read_bytes()
+    output.write_bytes(b"tampered PLY")
+    assert not rad_is_complete(run_dir)
+    output.write_bytes(merged_bytes)
+    write_rad_receipt(run_dir, ["LichtFeld-Studio", "convert"])
+    assert rad_is_complete(run_dir)
+
+    rad.write_bytes(b"tampered")
+    assert not rad_is_complete(run_dir)
+    write_rad_failure(run_dir, ["LichtFeld-Studio", "convert"], 23, "converter failed")
+    assert rad_receipt_state(run_dir) == "failed"
+    assert not rad_is_complete(run_dir)
